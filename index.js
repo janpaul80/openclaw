@@ -8,11 +8,11 @@ const HOST = "0.0.0.0";
 // SECRET_KEY: The bot secret from Copilot Studio > Settings > Security > Web channel security
 // This secret is used directly with the Direct Line API (no token endpoint needed)
 const MICROSOFT_STUDIO_SECRET_KEY = process.env.MICROSOFT_STUDIO_SECRET_KEY || "";
-const DIRECT_LINE_BASE = "https://directline.botframework.com/v3/directline";
+const DIRECT_LINE_BASE = process.env.DIRECT_LINE_BASE || "https://europe.directline.botframework.com/v3/directline";
 
 // Startup logging
 console.log("========================================");
-console.log("OpenClaw Orchestrator v2.0.0 Starting...");
+console.log("OpenClaw Orchestrator v2.1.0 Starting...");
 console.log("========================================");
 console.log(`PORT: ${PORT}`);
 console.log(`HOST: ${HOST}`);
@@ -186,7 +186,7 @@ app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     service: "openclaw",
-    version: "2.0.0",
+    version: "2.1.0",
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
     microsoftStudio: {
@@ -204,7 +204,7 @@ app.get("/", (req, res) => {
   res.json({
     service: "openclaw",
     status: "running",
-    version: "2.0.0",
+    version: "2.1.0",
     endpoints: ["/health", "/agents/invoke", "/config/status"],
     microsoftStudio: {
       configured: isCopilotConfigured()
@@ -219,7 +219,7 @@ app.get("/config/status", (req, res) => {
     : "NOT SET";
   res.json({
     service: "openclaw",
-    version: "2.0.1",
+    version: "2.1.0",
     config: {
       MICROSOFT_STUDIO_SECRET_KEY: MICROSOFT_STUDIO_SECRET_KEY ? `SET (${MICROSOFT_STUDIO_SECRET_KEY.length} chars)` : "NOT SET",
       MICROSOFT_STUDIO_SECRET_KEY_PREVIEW: secretPreview,
@@ -348,7 +348,7 @@ app.use((err, req, res, next) => {
 // Start server
 const server = app.listen(PORT, HOST, () => {
   console.log("========================================");
-  console.log(`✅ OpenClaw v2.0.0 running on http://${HOST}:${PORT}`);
+  console.log(`✅ OpenClaw v2.1.0 running on http://${HOST}:${PORT}`);
   console.log(`✅ Health check: http://${HOST}:${PORT}/health`);
   console.log(`✅ Copilot Studio: ${isCopilotConfigured() ? "CONFIGURED ✓" : "NOT CONFIGURED ✗"}`);
   console.log("========================================");
