@@ -214,11 +214,15 @@ app.get("/", (req, res) => {
 
 // Configuration status endpoint (for debugging)
 app.get("/config/status", (req, res) => {
+  const secretPreview = MICROSOFT_STUDIO_SECRET_KEY 
+    ? `${MICROSOFT_STUDIO_SECRET_KEY.substring(0, 10)}...${MICROSOFT_STUDIO_SECRET_KEY.substring(MICROSOFT_STUDIO_SECRET_KEY.length - 10)}`
+    : "NOT SET";
   res.json({
     service: "openclaw",
-    version: "2.0.0",
+    version: "2.0.1",
     config: {
       MICROSOFT_STUDIO_SECRET_KEY: MICROSOFT_STUDIO_SECRET_KEY ? `SET (${MICROSOFT_STUDIO_SECRET_KEY.length} chars)` : "NOT SET",
+      MICROSOFT_STUDIO_SECRET_KEY_PREVIEW: secretPreview,
       DIRECT_LINE_BASE: DIRECT_LINE_BASE,
       PORT: PORT,
       NODE_ENV: process.env.NODE_ENV || "development"
@@ -228,6 +232,32 @@ app.get("/config/status", (req, res) => {
     },
     activeSessions: conversationCache.size
   });
+});
+
+// Direct test endpoint - test Direct Line from the server itself
+app.get("/debug/test-directline", async (req, res) => {
+  try {
+    const response = await fetch(`${DIRECT_LINE_BASE}/conversations`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${MICROSOFT_STUDIO_SECRET_KEY}`,
+        "Content-Type": "application/json"
+      }
+    });
+    const status = response.status;
+    const body = await response.text();
+    res.json({
+      directLineStatus: status,
+      directLineResponse: body.substring(0, 500),
+      secretLength: MICROSOFT_STUDIO_SECRET_KEY.length,
+      secretPreview: `${MICROSOFT_STUDIO_SECRET_KEY.substring(0, 10)}...${MICROSOFT_STUDIO_SECRET_KEY.substring(MICROSOFT_STUDIO_SECRET_KEY.length - 10)}`
+    });
+  } catch (error) {
+    res.json({
+      error: error.message,
+      secretLength: MICROSOFT_STUDIO_SECRET_KEY.length
+    });
+  }
 });
 
 // Agent invocation endpoint - the core orchestrator function
