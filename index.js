@@ -19,7 +19,22 @@ const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "qwen2.5-coder:14b";
 // ============================================================
 // Agent Role → Provider Routing
 // ============================================================
-const MICROSOFT_ROLES = ["planner", "architect", "supervisor", "reviewer", "analyst", "strategist", "coordinator"];
+// Microsoft Copilot Studio: 7 supervisory agents (brain & orchestrator)
+// These agents PLAN, COORDINATE, and SUPERVISE — they do NOT generate bulk code
+const MICROSOFT_ROLES = ["planner", "frontend", "backend", "devops", "qa", "android", "ios"];
+
+// Microsoft role display names (matching Copilot Studio exactly)
+const MICROSOFT_ROLE_NAMES = {
+  planner: "Planning Architect",
+  frontend: "Frontend Engineer",
+  backend: "Backend Agent",
+  devops: "DevOps Agent",
+  qa: "QA Agent Specialist",
+  android: "Android Agent",
+  ios: "iOS Agent"
+};
+
+// Qwen via Ollama: execution muscle (bulk code generation, installs, fixes)
 const QWEN_ROLES = ["builder", "installer", "fixer", "coder", "executor"];
 
 function getProviderForRole(role) {
@@ -30,10 +45,16 @@ function getProviderForRole(role) {
   if (QWEN_ROLES.includes(normalizedRole)) {
     return "qwen";
   }
-  // Default: planning roles go to Microsoft, execution to Qwen
-  if (normalizedRole.includes("plan") || normalizedRole.includes("architect") || normalizedRole.includes("review")) {
-    return "microsoft";
-  }
+  // Fuzzy matching for aliases
+  if (normalizedRole.includes("plan") || normalizedRole.includes("architect")) return "microsoft";
+  if (normalizedRole.includes("front")) return "microsoft";
+  if (normalizedRole.includes("back")) return "microsoft";
+  if (normalizedRole.includes("devops") || normalizedRole.includes("deploy")) return "microsoft";
+  if (normalizedRole.includes("qa") || normalizedRole.includes("test") || normalizedRole.includes("quality")) return "microsoft";
+  if (normalizedRole.includes("android") || normalizedRole.includes("mobile")) return "microsoft";
+  if (normalizedRole.includes("ios") || normalizedRole.includes("apple") || normalizedRole.includes("swift")) return "microsoft";
+  if (normalizedRole.includes("build") || normalizedRole.includes("code") || normalizedRole.includes("install") || normalizedRole.includes("fix")) return "qwen";
+  // Default: unknown roles go to Qwen for execution
   return "qwen";
 }
 
@@ -50,7 +71,7 @@ console.log(`NODE_ENV: ${process.env.NODE_ENV || "development"}`);
 console.log("--- Provider 1: Microsoft Copilot Studio ---");
 console.log(`  Secret: ${MICROSOFT_STUDIO_SECRET_KEY ? `SET ✓ (${MICROSOFT_STUDIO_SECRET_KEY.length} chars)` : "NOT SET ✗"}`);
 console.log(`  Direct Line: ${DIRECT_LINE_BASE}`);
-console.log(`  Roles: ${MICROSOFT_ROLES.join(", ")}`);
+console.log(`  Roles: ${MICROSOFT_ROLES.map(r => MICROSOFT_ROLE_NAMES[r] || r).join(", ")}`);
 console.log("--- Provider 2: Qwen via Ollama ---");
 console.log(`  Base URL: ${OLLAMA_BASE_URL}`);
 console.log(`  Model: ${OLLAMA_MODEL}`);
@@ -593,7 +614,7 @@ app.get("/health", async (req, res) => {
 app.get("/agents", (req, res) => {
   const microsoftAgents = MICROSOFT_ROLES.map(role => ({
     id: role,
-    name: role.charAt(0).toUpperCase() + role.slice(1),
+    name: MICROSOFT_ROLE_NAMES[role] || role.charAt(0).toUpperCase() + role.slice(1),
     provider: "microsoft",
     role: "Planning & Supervision",
     status: isMicrosoftConfigured() ? "active" : "inactive"
@@ -612,7 +633,8 @@ app.get("/agents", (req, res) => {
     routing: {
       microsoft: MICROSOFT_ROLES,
       qwen: QWEN_ROLES
-    }
+    },
+    microsoftAgentNames: MICROSOFT_ROLE_NAMES
   });
 });
 
@@ -1001,7 +1023,7 @@ const server = app.listen(PORT, HOST, async () => {
   console.log(`✅ Agents: http://${HOST}:${PORT}/agents`);
   console.log("--- Microsoft Copilot Studio (PRIMARY) ---");
   console.log(`  ${isMicrosoftConfigured() ? "✅ CONFIGURED" : "❌ NOT CONFIGURED"}`);
-  console.log(`  Roles: ${MICROSOFT_ROLES.join(", ")}`);
+  console.log(`  Roles: ${MICROSOFT_ROLES.map(r => MICROSOFT_ROLE_NAMES[r] || r).join(", ")}`);
   console.log("--- Qwen via Ollama (SECONDARY) ---");
   console.log(`  Ollama: ${ollamaHealth.status} (${OLLAMA_BASE_URL})`);
   if (ollamaHealth.status === "ok") {
