@@ -581,6 +581,84 @@ async function streamAgent(sessionId, prompt, role, conversationHistory = [], ap
 // Routes
 // ============================================================
 
+// Network diagnostic endpoint - tests Ollama connectivity from inside container
+app.get("/debug/network", async (req, res) => {
+  console.log("[OpenClaw] Running network diagnostics...");
+  
+  const testUrls = [
+    { name: "Docker bridge (IPv4)", url: "http://172.17.0.1:11434" },
+    { name: "Docker bridge (IPv6)", url: "http://[::1]:11434" },
+    { name: "host.docker.internal", url: "http://host.docker.internal:11434" },
+    { name: "localhost", url: "http://localhost:11434" },
+    { name: "127.0.0.1", url: "http://127.0.0.1:11434" },
+    { name: "Public IP", url: "http://74.208.158.106:11434" },
+    { name: "Configured URL", url: OLLAMA_BASE_URL }
+  ];
+
+  const results = [];
+
+  for (const test of testUrls) {
+    const startTime = Date.now();
+    try {
+      const response = await fetch(`${test.url}/api/tags`, {
+        signal: AbortSignal.timeout(5000)
+      });
+      const latency = Date.now() - startTime;
+      
+      if (response.ok) {
+        const data = await response.json();
+        const models = (data.models || []).map(m => m.name);
+        results.push({
+          name: test.name,
+          url: test.url,
+          status: "success",
+          latencyMs: latency,
+          models,
+          hasQwen: models.some(m => m.includes("qwen"))
+        });
+      } else {
+        results.push({
+          name: test.name,
+          url: test.url,
+          status: "http_error",
+          httpStatus: response.status,
+          latencyMs: latency
+        });
+      }
+    } catch (err) {
+      results.push({
+        name: test.name,
+        url: test.url,
+        status: "failed",
+        error: err.message,
+        latencyMs: Date.now() - startTime
+      });
+    }
+  }
+
+  // Find working URL
+  const working = results.find(r => r.status === "success" && r.hasQwen);
+  const anyWorking = results.find(r => r.status === "success");
+
+  console.log("[OpenClaw] Network diagnostics complete");
+  results.forEach(r => {
+    console.log(`  ${r.name}: ${r.status} (${r.latencyMs}ms) ${r.error || ""}`);
+  });
+
+  res.json({
+    timestamp: new Date().toISOString(),
+    configuredUrl: OLLAMA_BASE_URL,
+    configuredModel: OLLAMA_MODEL,
+    recommendation: working ? working.url : (anyWorking ? anyWorking.url : "No working URL found"),
+    results,
+    summary: {
+      total: results.length,
+      successful: results.filter(r => r.status === "success").length,
+      withQwen: results.filter(r => r.hasQwen).length
+    }
+  });
+});
+
 // Health check
 app.get("/health", async (req, res) => {
   const ollamaHealth = await checkOllamaHealth();
