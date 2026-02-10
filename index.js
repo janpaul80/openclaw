@@ -13,7 +13,7 @@ const MICROSOFT_STUDIO_SECRET_KEY = process.env.MICROSOFT_STUDIO_SECRET_KEY || "
 const DIRECT_LINE_BASE = process.env.DIRECT_LINE_BASE || "https://europe.directline.botframework.com/v3/directline";
 
 // Provider 2: Qwen via Ollama (SECONDARY - Execution/Building)
-const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://host.docker.internal:11434";
+const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://10.0.1.1:11434";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "qwen2.5-coder:14b";
 
 // ============================================================
