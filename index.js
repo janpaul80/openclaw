@@ -581,22 +581,136 @@ async function streamAgent(sessionId, prompt, role, conversationHistory = [], ap
 // Routes
 // ============================================================
 
-// Network diagnostic endpoint - tests Ollama connectivity from inside container
+// Network diagnostic endpoint - comprehensive container network analysis
 app.get("/debug/network", async (req, res) => {
-  console.log("[OpenClaw] Running network diagnostics...");
+  console.log("[OpenClaw] Running comprehensive network diagnostics...");
   
+  const { execSync } = await import("child_process");
+  const os = await import("os");
+  const dns = await import("dns");
+  const { promisify } = await import("util");
+  const dnsResolve = promisify(dns.resolve);
+  const dnsResolve4 = promisify(dns.resolve4);
+  
+  // Step 1: Gather container network info
+  let networkInfo = {};
+  try {
+    const interfaces = os.networkInterfaces();
+    networkInfo.interfaces = {};
+    for (const [name, addrs] of Object.entries(interfaces)) {
+      networkInfo.interfaces[name] = addrs.map(a => ({
+        address: a.address,
+        family: a.family,
+        internal: a.internal
+      }));
+    }
+  } catch (e) { networkInfo.interfaceError = e.message; }
+
+  // Step 2: Get default gateway
+  let gateway = null;
+  try {
+    const routeOutput = execSync("ip route 2>/dev/null || route -n 2>/dev/null || echo 'no route cmd'", { encoding: "utf8", timeout: 3000 });
+    networkInfo.routes = routeOutput.trim().split("\n").slice(0, 10);
+    const defaultMatch = routeOutput.match(/default via (\S+)/);
+    if (defaultMatch) {
+      gateway = defaultMatch[1];
+      networkInfo.defaultGateway = gateway;
+    }
+  } catch (e) { networkInfo.routeError = e.message; }
+
+  // Step 3: DNS resolution for host.docker.internal
+  let hostDockerIP = null;
+  try {
+    const ips = await dnsResolve4("host.docker.internal");
+    hostDockerIP = ips[0];
+    networkInfo.hostDockerInternal = { resolved: true, ips };
+  } catch (e) {
+    networkInfo.hostDockerInternal = { resolved: false, error: e.message };
+    // Try /etc/hosts
+    try {
+      const hosts = execSync("cat /etc/hosts 2>/dev/null || echo 'no hosts file'", { encoding: "utf8", timeout: 2000 });
+      const hostLine = hosts.split("\n").find(l => l.includes("host.docker.internal"));
+      if (hostLine) {
+        const ip = hostLine.trim().split(/\s+/)[0];
+        hostDockerIP = ip;
+        networkInfo.hostDockerInternal.fromHosts = hostLine.trim();
+        networkInfo.hostDockerInternal.ip = ip;
+      }
+    } catch (e2) { /* ignore */ }
+  }
+
+  // Step 4: Check /etc/hosts for any useful entries
+  try {
+    const hosts = execSync("cat /etc/hosts 2>/dev/null", { encoding: "utf8", timeout: 2000 });
+    networkInfo.etcHosts = hosts.trim().split("\n").filter(l => l.trim() && !l.startsWith("#"));
+  } catch (e) { /* ignore */ }
+
+  // Step 5: Build dynamic test URLs based on discovered network
   const testUrls = [
-    { name: "Docker bridge (IPv4)", url: "http://172.17.0.1:11434" },
-    { name: "Docker bridge (IPv6)", url: "http://[::1]:11434" },
+    { name: "Docker default bridge (172.17.0.1)", url: "http://172.17.0.1:11434" },
     { name: "host.docker.internal", url: "http://host.docker.internal:11434" },
-    { name: "localhost", url: "http://localhost:11434" },
-    { name: "127.0.0.1", url: "http://127.0.0.1:11434" },
+    { name: "localhost IPv4", url: "http://127.0.0.1:11434" },
+    { name: "localhost IPv6", url: "http://[::1]:11434" },
     { name: "Public IP", url: "http://74.208.158.106:11434" },
-    { name: "Configured URL", url: OLLAMA_BASE_URL }
   ];
 
-  const results = [];
+  // Add gateway-based URL if different from 172.17.0.1
+  if (gateway && gateway !== "172.17.0.1") {
+    testUrls.unshift({ name: `Default gateway (${gateway})`, url: `http://${gateway}:11434` });
+  }
 
+  // Add resolved host.docker.internal IP if available
+  if (hostDockerIP && hostDockerIP !== "172.17.0.1") {
+    testUrls.splice(1, 0, { name: `host.docker.internal resolved (${hostDockerIP})`, url: `http://${hostDockerIP}:11434` });
+  }
+
+  // Add configured URL if unique
+  const configuredInList = testUrls.some(t => t.url === OLLAMA_BASE_URL);
+  if (!configuredInList) {
+    testUrls.push({ name: "Configured URL", url: OLLAMA_BASE_URL });
+  }
+
+  // Step 6: Test Coolify API (known to work from containers) as control test
+  let coolifyReachable = false;
+  try {
+    const coolifyResp = await fetch("http://host.docker.internal:8000/api/v1/version", {
+      signal: AbortSignal.timeout(3000)
+    });
+    coolifyReachable = coolifyResp.ok || coolifyResp.status < 500;
+    networkInfo.coolifyApiTest = { 
+      url: "http://host.docker.internal:8000",
+      reachable: true, 
+      status: coolifyResp.status 
+    };
+  } catch (e) {
+    networkInfo.coolifyApiTest = { 
+      url: "http://host.docker.internal:8000",
+      reachable: false, 
+      error: e.message 
+    };
+    // Try gateway IP for Coolify
+    if (gateway) {
+      try {
+        const gwResp = await fetch(`http://${gateway}:8000/api/v1/version`, {
+          signal: AbortSignal.timeout(3000)
+        });
+        networkInfo.coolifyViaGateway = { 
+          url: `http://${gateway}:8000`,
+          reachable: true, 
+          status: gwResp.status 
+        };
+      } catch (e2) {
+        networkInfo.coolifyViaGateway = { 
+          url: `http://${gateway}:8000`,
+          reachable: false, 
+          error: e2.message 
+        };
+      }
+    }
+  }
+
+  // Step 7: Test each Ollama URL
+  const results = [];
   for (const test of testUrls) {
     const startTime = Date.now();
     try {
@@ -636,9 +750,27 @@ app.get("/debug/network", async (req, res) => {
     }
   }
 
-  // Find working URL
+  // Step 8: Find working URL and generate recommendation
   const working = results.find(r => r.status === "success" && r.hasQwen);
   const anyWorking = results.find(r => r.status === "success");
+
+  let recommendation = "No working URL found";
+  let fixSuggestion = null;
+
+  if (working) {
+    recommendation = working.url;
+  } else if (anyWorking) {
+    recommendation = anyWorking.url;
+  } else {
+    // Generate fix suggestion based on diagnostics
+    if (coolifyReachable) {
+      fixSuggestion = "host.docker.internal resolves and Coolify API is reachable on port 8000, but Ollama port 11434 is blocked. Check if Ollama is listening on 0.0.0.0 (not just [::]) and check iptables rules.";
+    } else if (gateway) {
+      fixSuggestion = `Container gateway is ${gateway}. Neither Coolify (port 8000) nor Ollama (port 11434) reachable via gateway. Possible iptables/firewall blocking Docker→Host traffic. Run on host: sudo iptables -I INPUT -i docker0 -j ACCEPT && sudo iptables -I INPUT -i br-+ -j ACCEPT`;
+    } else {
+      fixSuggestion = "Cannot determine container gateway. Container may be in isolated network mode.";
+    }
+  }
 
   console.log("[OpenClaw] Network diagnostics complete");
   results.forEach(r => {
@@ -649,12 +781,15 @@ app.get("/debug/network", async (req, res) => {
     timestamp: new Date().toISOString(),
     configuredUrl: OLLAMA_BASE_URL,
     configuredModel: OLLAMA_MODEL,
-    recommendation: working ? working.url : (anyWorking ? anyWorking.url : "No working URL found"),
+    recommendation,
+    fixSuggestion,
+    networkInfo,
     results,
     summary: {
       total: results.length,
       successful: results.filter(r => r.status === "success").length,
-      withQwen: results.filter(r => r.hasQwen).length
+      withQwen: results.filter(r => r.hasQwen).length,
+      coolifyReachable
     }
   });
 });
