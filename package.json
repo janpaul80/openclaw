@@ -1,6 +1,7 @@
 {
   "name": "openclaw",
-  "version": "0.1.0",
+  "version": "3.1.0",
+  "description": "OpenClaw Orchestrator - Dual Provider (Microsoft Copilot Studio + Qwen/Ollama)",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,5 +9,8 @@
   },
   "dependencies": {
     "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
   }
 }
