@@ -438,7 +438,7 @@ async function invokeQwen(systemPrompt, userPrompt, conversationHistory = []) {
       max_tokens: 8192,
       stream: false
     }),
-    signal: AbortSignal.timeout(120000)
+    signal: AbortSignal.timeout(600000)  // PHASE 0: Increased from 120s to 600s (10 minutes)
   });
 
   if (!response.ok) {
@@ -447,13 +447,20 @@ async function invokeQwen(systemPrompt, userPrompt, conversationHistory = []) {
   }
 
   const data = await response.json();
+  const duration = Date.now() - startTime;
+  const tokenCount = data.usage?.completion_tokens || 0;
+  
+  // PHASE 0: Detailed logging
+  console.log(`[OpenClaw] Qwen invoke complete: model=${OLLAMA_MODEL}, tokens=${tokenCount}, duration=${duration}ms`);
+  
   return {
     content: data.choices?.[0]?.message?.content || "",
     provider: "qwen",
     model: data.model || OLLAMA_MODEL,
-    latencyMs: Date.now() - startTime,
+    latencyMs: duration,
     usage: data.usage || {},
-    finishReason: data.choices?.[0]?.finish_reason || "stop"
+    finishReason: data.choices?.[0]?.finish_reason || "stop",
+    tokenCount
   };
 }
 
@@ -467,6 +474,8 @@ async function streamQwen(systemPrompt, userPrompt, conversationHistory = [], on
 
   const startTime = Date.now();
   let fullContent = "";
+  let tokenCount = 0;
+  let lastProgressUpdate = Date.now();
 
   const response = await fetch(`${OLLAMA_BASE_URL}/v1/chat/completions`, {
     method: "POST",
@@ -478,7 +487,7 @@ async function streamQwen(systemPrompt, userPrompt, conversationHistory = [], on
       max_tokens: 8192,
       stream: true
     }),
-    signal: AbortSignal.timeout(180000)
+    signal: AbortSignal.timeout(900000)  // PHASE 0: Increased from 180s to 900s (15 minutes)
   });
 
   if (!response.ok) {
@@ -509,7 +518,16 @@ async function streamQwen(systemPrompt, userPrompt, conversationHistory = [], on
         const delta = parsed.choices?.[0]?.delta?.content;
         if (delta) {
           fullContent += delta;
+          tokenCount++;
           onToken(delta);
+          
+          // PHASE 0: Progress indicators every 5 seconds
+          const now = Date.now();
+          if (now - lastProgressUpdate > 5000) {
+            const elapsed = Math.round((now - startTime) / 1000);
+            console.log(`[OpenClaw] Streaming progress: ${tokenCount} tokens, ${elapsed}s elapsed`);
+            lastProgressUpdate = now;
+          }
         }
       } catch {
         // Skip malformed JSON
@@ -517,13 +535,66 @@ async function streamQwen(systemPrompt, userPrompt, conversationHistory = [], on
     }
   }
 
+  const duration = Date.now() - startTime;
+  
+  // PHASE 0: Detailed logging
+  console.log(`[OpenClaw] Qwen stream complete: model=${OLLAMA_MODEL}, tokens=${tokenCount}, duration=${duration}ms`);
+
   return {
     content: fullContent,
     provider: "qwen",
     model: OLLAMA_MODEL,
-    latencyMs: Date.now() - startTime,
-    tokenCount: fullContent.split(/\s+/).length
+    latencyMs: duration,
+    tokenCount
   };
+}
+
+// ============================================================
+// PHASE 0: Retry Logic for Connection Errors
+// ============================================================
+
+async function invokeQwenWithRetry(systemPrompt, userPrompt, conversationHistory = [], maxRetries = 2) {
+  let lastError;
+  let retryCount = 0;
+  
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const result = await invokeQwen(systemPrompt, userPrompt, conversationHistory);
+      
+      if (attempt > 0) {
+        console.log(`[OpenClaw] Qwen retry succeeded on attempt ${attempt + 1}`);
+      }
+      
+      return {
+        ...result,
+        retryCount: attempt
+      };
+    } catch (error) {
+      lastError = error;
+      retryCount = attempt + 1;
+      
+      // Only retry on connection/timeout errors
+      const isRetryable = error.message.includes('connection') || 
+                          error.message.includes('timeout') ||
+                          error.message.includes('ECONNREFUSED') ||
+                          error.message.includes('ETIMEDOUT') ||
+                          error.message.includes('fetch failed');
+      
+      if (isRetryable && attempt < maxRetries) {
+        const delay = 2000 * (attempt + 1);  // Exponential backoff: 2s, 4s
+        console.log(`[OpenClaw] Qwen connection error, retrying in ${delay}ms (${attempt + 1}/${maxRetries})...`);
+        console.log(`[OpenClaw] Error: ${error.message}`);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      
+      // Don't retry other errors
+      console.error(`[OpenClaw] Qwen error (not retryable or max retries exceeded): ${error.message}`);
+      throw error;
+    }
+  }
+  
+  throw lastError;
 }
 
 // ============================================================
@@ -546,7 +617,8 @@ async function invokeAgent(sessionId, prompt, role, conversationHistory = [], ap
       finalPrompt = `APPROVED PLAN:\n${approvedPlan}\n\nNow implement this plan fully. Generate all files.\n\nOriginal request: ${prompt}`;
     }
 
-    return await invokeQwen(systemPrompt, finalPrompt, conversationHistory);
+    // PHASE 0: Use retry wrapper
+    return await invokeQwenWithRetry(systemPrompt, finalPrompt, conversationHistory);
   }
 }
 
@@ -854,6 +926,11 @@ app.get("/agents", (req, res) => {
 // Invoke agent (non-streaming)
 app.post("/invoke", async (req, res) => {
   const startTime = Date.now();
+  
+  // PHASE 0: Set request/response timeouts
+  req.setTimeout(600000);  // 10 minutes
+  res.setTimeout(600000);
+  
   try {
     const { prompt, sessionId, mode, conversationHistory, platform, approvedPlan } = req.body;
 
@@ -880,7 +957,9 @@ app.post("/invoke", async (req, res) => {
     }
 
     const duration = Date.now() - startTime;
-    console.log(`[OpenClaw] Response: ${duration}ms, ${result.content.length} chars, provider=${result.provider}`);
+    
+    // PHASE 0: Enhanced logging with retry count
+    console.log(`[OpenClaw] Response: ${duration}ms, ${result.content.length} chars, provider=${result.provider}, retries=${result.retryCount || 0}`);
 
     res.json({
       success: true,
@@ -895,7 +974,9 @@ app.post("/invoke", async (req, res) => {
         latencyMs: result.latencyMs,
         platform: platform || "web",
         mode: agentRole,
-        duration
+        duration,
+        retryCount: result.retryCount || 0,
+        tokenCount: result.tokenCount || 0
       }
     });
   } catch (error) {
@@ -911,6 +992,11 @@ app.post("/invoke", async (req, res) => {
 // Invoke agent with streaming (SSE)
 app.post("/invoke/stream", async (req, res) => {
   const startTime = Date.now();
+  
+  // PHASE 0: Set request/response timeouts for streaming
+  req.setTimeout(900000);  // 15 minutes
+  res.setTimeout(900000);
+  
   try {
     const { prompt, sessionId, mode, conversationHistory, platform, approvedPlan } = req.body;
 
@@ -926,50 +1012,60 @@ app.post("/invoke/stream", async (req, res) => {
 
     console.log(`[OpenClaw] Stream: role=${agentRole}, provider=${provider}, session=${sessionId || "none"}`);
 
-    // Set up SSE
+    // PHASE 0: Set up SSE with keep-alive
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       "Connection": "keep-alive",
-      "X-Accel-Buffering": "no"
+      "X-Accel-Buffering": "no",
+      "Keep-Alive": "timeout=900"  // 15 minutes
     });
 
-    res.write(`data: ${JSON.stringify({ type: "agent_start", agentId: agentRole, agentName: agentRole.charAt(0).toUpperCase() + agentRole.slice(1), provider })}\n\n`);
+    // PHASE 0: Heartbeat to keep connection alive
+    const heartbeat = setInterval(() => {
+      res.write(': heartbeat\n\n');
+    }, 30000);  // Every 30 seconds
 
-    let tokenCount = 0;
-    const result = await streamAgent(sessionId || `temp-${Date.now()}`, prompt, agentRole, history, plan, (token) => {
-      tokenCount++;
-      res.write(`data: ${JSON.stringify({ type: "token", content: token, agentId: agentRole })}\n\n`);
-    });
+    try {
+      res.write(`data: ${JSON.stringify({ type: "agent_start", agentId: agentRole, agentName: agentRole.charAt(0).toUpperCase() + agentRole.slice(1), provider })}\n\n`);
 
-    // Update session history
-    if (session) {
-      session.history.push({ role: "user", content: prompt });
-      session.history.push({ role: "assistant", content: result.content });
-      if (session.history.length > 20) {
-        session.history = session.history.slice(-16);
+      let tokenCount = 0;
+      const result = await streamAgent(sessionId || `temp-${Date.now()}`, prompt, agentRole, history, plan, (token) => {
+        tokenCount++;
+        res.write(`data: ${JSON.stringify({ type: "token", content: token, agentId: agentRole })}\n\n`);
+      });
+
+      // Update session history
+      if (session) {
+        session.history.push({ role: "user", content: prompt });
+        session.history.push({ role: "assistant", content: result.content });
+        if (session.history.length > 20) {
+          session.history = session.history.slice(-16);
+        }
       }
-    }
 
-    const duration = Date.now() - startTime;
-    console.log(`[OpenClaw] Stream done: ${duration}ms, ${tokenCount} tokens, provider=${result.provider}`);
+      const duration = Date.now() - startTime;
+      console.log(`[OpenClaw] Stream done: ${duration}ms, ${tokenCount} tokens, provider=${result.provider}`);
 
-    res.write(`data: ${JSON.stringify({
-      type: "done",
-      agentId: agentRole,
-      agentName: agentRole.charAt(0).toUpperCase() + agentRole.slice(1),
-      provider: result.provider,
-      content: result.content,
-      metadata: {
+      res.write(`data: ${JSON.stringify({
+        type: "done",
+        agentId: agentRole,
+        agentName: agentRole.charAt(0).toUpperCase() + agentRole.slice(1),
         provider: result.provider,
-        model: result.model,
-        latencyMs: result.latencyMs,
-        tokenCount,
-        duration
-      }
-    })}\n\n`);
+        content: result.content,
+        metadata: {
+          provider: result.provider,
+          model: result.model,
+          latencyMs: result.latencyMs,
+          tokenCount,
+          duration
+        }
+      })}\n\n`);
 
-    res.end();
+      res.end();
+    } finally {
+      clearInterval(heartbeat);
+    }
   } catch (error) {
     console.error(`[OpenClaw] Stream error:`, error.message);
     if (!res.headersSent) {
