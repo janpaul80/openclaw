@@ -13,7 +13,7 @@ const MICROSOFT_STUDIO_SECRET_KEY = process.env.MICROSOFT_STUDIO_SECRET_KEY || "
 const DIRECT_LINE_BASE = process.env.DIRECT_LINE_BASE || "https://europe.directline.botframework.com/v3/directline";
 
 // Provider 2: Qwen via Ollama (SECONDARY - Execution/Building)
-const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://10.0.1.1:11434";
+const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://87.106.111.220:11434";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "qwen2.5-coder:14b";
 
 // ============================================================
@@ -62,7 +62,7 @@ function getProviderForRole(role) {
 // Startup Logging
 // ============================================================
 console.log("========================================");
-console.log("OpenClaw Orchestrator v3.1.0 Starting...");
+console.log("OpenClaw Orchestrator v3.2.0 Starting...");
 console.log("  DUAL PROVIDER Architecture");
 console.log("========================================");
 console.log(`PORT: ${PORT}`);
@@ -802,7 +802,7 @@ app.get("/health", async (req, res) => {
   res.json({
     status: isMicrosoftConfigured() ? "ok" : "degraded",
     service: "openclaw",
-    version: "3.1.0",
+    version: "3.2.0",
     architecture: "dual-provider",
     uptime,
     timestamp: new Date().toISOString(),
@@ -1231,7 +1231,7 @@ app.use((err, req, res, next) => {
 const server = app.listen(PORT, HOST, async () => {
   const ollamaHealth = await checkOllamaHealth();
   console.log("========================================");
-  console.log(`✅ OpenClaw v3.1.0 DUAL PROVIDER running on http://${HOST}:${PORT}`);
+  console.log(`✅ OpenClaw v3.2.0 DUAL PROVIDER running on http://${HOST}:${PORT}`);
   console.log(`✅ Health: http://${HOST}:${PORT}/health`);
   console.log(`✅ Agents: http://${HOST}:${PORT}/agents`);
   console.log("--- Microsoft Copilot Studio (PRIMARY) ---");
