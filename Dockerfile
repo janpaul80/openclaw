@@ -7,7 +7,7 @@ COPY package.json ./
 RUN npm install --production
 
 # Copy application code
-COPY index.js ./
+COPY index.js orchestrator.js sandboxManager.js autonomousLoop.js ./
 
 # Set environment
 ENV NODE_ENV=production
