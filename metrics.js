@@ -331,4 +331,4 @@ export function resetMetrics() {
   register.resetMetrics();
 }
 
-export default logger;
+export default register;
