@@ -2,6 +2,9 @@ FROM node:20-alpine
 
 WORKDIR /app
 
+# Install OpenSSH client for VPS sandbox access
+RUN apk add --no-cache openssh-client
+
 # Copy package files and install production deps
 COPY package.json ./
 RUN npm install --production
