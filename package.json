@@ -1,7 +1,7 @@
 {
   "name": "openclaw",
-  "version": "3.2.0",
-  "description": "OpenClaw Orchestrator - Dual Provider (Microsoft Copilot Studio + Qwen/Ollama)",
+  "version": "4.0.0",
+  "description": "OpenClaw Orchestrator - Autonomous Build Loop with VPS Docker Sandbox (Phase 1)",
   "private": true,
   "type": "module",
   "scripts": {

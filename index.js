@@ -1,5 +1,8 @@
 
 import express from "express";
+import sandboxManager from "./sandboxManager.js";
+import orchestrator from "./orchestrator.js";
+import autonomousLoop from "./autonomousLoop.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -1298,6 +1301,184 @@ app.post("/invoke/multi/stream", async (req, res) => {
   }
 });
 
+// ============================================================
+// PHASE 1: AUTONOMOUS EXECUTION ROUTES
+// ============================================================
+
+// Start autonomous execution
+app.post("/autonomous/execute", async (req, res) => {
+  const startTime = Date.now();
+  
+  try {
+    const { prompt, sessionId } = req.body;
+
+    if (!prompt || typeof prompt !== "string" || prompt.trim().length === 0) {
+      return res.status(400).json({ success: false, error: "Prompt is required" });
+    }
+
+    if (!sessionId) {
+      return res.status(400).json({ success: false, error: "Session ID is required" });
+    }
+
+    console.log(`[OpenClaw] Starting autonomous execution for session ${sessionId}`);
+
+    // Create agent invokers
+    const agentInvokers = {
+      planner: async (prompt) => {
+        return await invokeAgent(sessionId, prompt, "planner", []);
+      },
+      builder: async (prompt, plan) => {
+        return await invokeAgent(sessionId, prompt, "builder", [], plan);
+      },
+      fixer: async (prompt) => {
+        return await invokeAgent(sessionId, prompt, "fixer", []);
+      }
+    };
+
+    // Start autonomous loop (non-blocking)
+    autonomousLoop.start(sessionId, prompt, agentInvokers, {
+      onEvent: (event) => {
+        console.log(`[OpenClaw] Autonomous event: ${event.type} (session ${sessionId})`);
+      }
+    }).then(result => {
+      console.log(`[OpenClaw] Autonomous execution completed for session ${sessionId}: ${result.success ? 'SUCCESS' : 'FAILED'}`);
+    }).catch(error => {
+      console.error(`[OpenClaw] Autonomous execution error for session ${sessionId}: ${error.message}`);
+    });
+
+    res.json({
+      success: true,
+      sessionId,
+      message: "Autonomous execution started",
+      duration: Date.now() - startTime
+    });
+  } catch (error) {
+    console.error(`[OpenClaw] Autonomous execute error:`, error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      duration: Date.now() - startTime
+    });
+  }
+});
+
+// Get autonomous execution status
+app.get("/autonomous/status/:sessionId", (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const status = autonomousLoop.getStatus(sessionId);
+
+    if (!status.found) {
+      return res.status(404).json({ success: false, error: "Execution not found" });
+    }
+
+    res.json({
+      success: true,
+      ...status
+    });
+  } catch (error) {
+    console.error(`[OpenClaw] Autonomous status error:`, error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get autonomous execution details
+app.get("/autonomous/details/:sessionId", (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const details = autonomousLoop.getDetails(sessionId);
+
+    if (!details) {
+      return res.status(404).json({ success: false, error: "Execution not found" });
+    }
+
+    res.json({
+      success: true,
+      ...details
+    });
+  } catch (error) {
+    console.error(`[OpenClaw] Autonomous details error:`, error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Stop autonomous execution
+app.post("/autonomous/stop/:sessionId", async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const result = await autonomousLoop.stop(sessionId, "manual");
+
+    res.json(result);
+  } catch (error) {
+    console.error(`[OpenClaw] Autonomous stop error:`, error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get autonomous metrics
+app.get("/autonomous/metrics", (req, res) => {
+  try {
+    const metrics = autonomousLoop.getMetrics();
+    res.json({ success: true, metrics });
+  } catch (error) {
+    console.error(`[OpenClaw] Autonomous metrics error:`, error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================================
+// PHASE 1: SANDBOX MANAGEMENT ROUTES
+// ============================================================
+
+// Get sandbox status
+app.get("/sandbox/status", (req, res) => {
+  try {
+    const status = sandboxManager.getStatus();
+    res.json({ success: true, ...status });
+  } catch (error) {
+    console.error(`[OpenClaw] Sandbox status error:`, error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// List active containers
+app.get("/sandbox/containers", (req, res) => {
+  try {
+    const status = sandboxManager.getStatus();
+    res.json({
+      success: true,
+      containers: status.containers,
+      active: status.active,
+      queued: status.queued
+    });
+  } catch (error) {
+    console.error(`[OpenClaw] Sandbox containers error:`, error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Force cleanup all containers
+app.delete("/sandbox/cleanup", async (req, res) => {
+  try {
+    const result = await sandboxManager.cleanupAll();
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error(`[OpenClaw] Sandbox cleanup error:`, error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Sandbox health check
+app.get("/sandbox/health", async (req, res) => {
+  try {
+    const health = await sandboxManager.healthCheck();
+    res.json({ success: true, ...health });
+  } catch (error) {
+    console.error(`[OpenClaw] Sandbox health error:`, error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Session management
 app.delete("/sessions/:sessionId", (req, res) => {
   const sid = req.params.sessionId;
@@ -1326,8 +1507,10 @@ app.use((err, req, res, next) => {
 // Start server
 const server = app.listen(PORT, HOST, async () => {
   const ollamaHealth = await checkOllamaHealth();
+  const sandboxHealth = await sandboxManager.healthCheck();
+  
   console.log("========================================");
-  console.log(`✅ OpenClaw v3.2.0 DUAL PROVIDER running on http://${HOST}:${PORT}`);
+  console.log(`✅ OpenClaw v4.0.0 AUTONOMOUS BUILD LOOP running on http://${HOST}:${PORT}`);
   console.log(`✅ Health: http://${HOST}:${PORT}/health`);
   console.log(`✅ Agents: http://${HOST}:${PORT}/agents`);
   console.log("--- Microsoft Copilot Studio (PRIMARY) ---");
@@ -1341,16 +1524,32 @@ const server = app.listen(PORT, HOST, async () => {
     console.log(`  ⚠️  Ollama not reachable: ${ollamaHealth.error}`);
   }
   console.log(`  Roles: ${QWEN_ROLES.join(", ")}`);
+  console.log("--- PHASE 1: Docker Sandbox (VPS) ---");
+  console.log(`  VPS: ${process.env.VPS_HOST || "87.106.111.220"}`);
+  console.log(`  Connection: SSH (secure)`);
+  console.log(`  Status: ${sandboxHealth.healthy ? "✅ HEALTHY" : "❌ UNHEALTHY"}`);
+  if (sandboxHealth.healthy) {
+    console.log(`  Docker: ${sandboxHealth.dockerVersion}`);
+  } else {
+    console.log(`  Error: ${sandboxHealth.error}`);
+  }
+  console.log(`  Max Containers: ${process.env.MAX_CONCURRENT_CONTAINERS || "3"}`);
+  console.log("--- PHASE 1: Autonomous Execution ---");
+  console.log(`  Orchestrator: ✅ READY`);
+  console.log(`  Max Iterations: 5`);
+  console.log(`  Max Duration: 15 minutes`);
   console.log("========================================");
 });
 
 // Graceful shutdown
-process.on("SIGTERM", () => {
+process.on("SIGTERM", async () => {
   console.log("SIGTERM received, shutting down...");
+  await sandboxManager.cleanupAll();
   server.close(() => process.exit(0));
 });
 
-process.on("SIGINT", () => {
+process.on("SIGINT", async () => {
   console.log("SIGINT received, shutting down...");
+  await sandboxManager.cleanupAll();
   server.close(() => process.exit(0));
 });
