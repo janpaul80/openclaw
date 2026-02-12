@@ -9,6 +9,8 @@
  */
 
 import sandboxManager from "./sandboxManager.js";
+import logger, { createSessionLogger, createExecutionLogger, logError, logPerformance } from "./logger.js";
+import { recordAgentInvocation, recordRetry, recordFixerResult, executionDuration } from "./metrics.js";
 
 // ============================================================
 // STATE MACHINE
@@ -48,7 +50,13 @@ class ExecutionOrchestrator {
    * Start autonomous execution
    */
   async startExecution(sessionId, prompt, agents, options = {}) {
-    console.log(`[Orchestrator] Starting execution for session ${sessionId}`);
+    const sessionLogger = createSessionLogger(sessionId);
+    const startTime = Date.now();
+    
+    sessionLogger.info({
+      type: 'orchestrator_start',
+      promptLength: prompt.length
+    }, `Starting execution orchestration for session ${sessionId}`);
     
     if (this.executions.has(sessionId)) {
       throw new Error(`Execution already running for session ${sessionId}`);
@@ -59,7 +67,7 @@ class ExecutionOrchestrator {
       prompt,
       agents, // { planner, builder, fixer }
       state: States.IDLE,
-      startTime: Date.now(),
+      startTime,
       iterations: [],
       currentIteration: 0,
       plan: null,
@@ -67,7 +75,8 @@ class ExecutionOrchestrator {
       errors: [],
       snapshots: [],
       events: [],
-      options
+      options,
+      logger: sessionLogger
     };
 
     this.executions.set(sessionId, execution);
@@ -84,7 +93,10 @@ class ExecutionOrchestrator {
     try {
       await this.runWorkflow(sessionId);
     } catch (error) {
-      console.error(`[Orchestrator] Execution failed: ${error.message}`);
+      logError(sessionLogger, error, {
+        type: 'orchestrator_failed',
+        duration_ms: Date.now() - startTime
+      });
       this.transitionTo(sessionId, States.FAILED, { error: error.message });
     }
 
@@ -101,7 +113,12 @@ class ExecutionOrchestrator {
       throw new Error(`No execution found for session ${sessionId}`);
     }
 
-    console.log(`[Orchestrator] Running workflow for session ${sessionId}`);
+    const sessionLogger = execution.logger;
+
+    sessionLogger.info({
+      type: 'workflow_start',
+      maxIterations: MAX_ITERATIONS
+    }, 'Running autonomous workflow');
 
     // Create sandbox container
     this.emitEvent(sessionId, "sandbox_creating", { message: "Creating isolated sandbox..." });
@@ -110,6 +127,11 @@ class ExecutionOrchestrator {
       const container = await sandboxManager.createContainer(sessionId);
       execution.containerId = container.id;
       this.emitEvent(sessionId, "sandbox_created", { containerId: container.id });
+      
+      sessionLogger.info({
+        type: 'sandbox_created',
+        containerId: container.id.substring(0, 12)
+      }, 'Sandbox container created');
     } catch (error) {
       this.emitEvent(sessionId, "sandbox_failed", { error: error.message });
       throw new Error(`Failed to create sandbox: ${error.message}`);
@@ -131,28 +153,57 @@ class ExecutionOrchestrator {
    */
   async executePlanning(sessionId) {
     const execution = this.executions.get(sessionId);
+    const sessionLogger = execution.logger;
+    const phaseLogger = createExecutionLogger(sessionId, 'planning');
+    const startTime = Date.now();
     
     this.transitionTo(sessionId, States.PLANNING);
     this.emitEvent(sessionId, "planning_start", { prompt: execution.prompt });
 
-    console.log(`[Orchestrator] Planning phase for session ${sessionId}`);
+    phaseLogger.info({
+      type: 'planning_start',
+      promptLength: execution.prompt.length
+    }, 'Starting planning phase');
 
     try {
       // Invoke planner agent
+      const recordAgent = recordAgentInvocation('planner', 'microsoft');
       const planResult = await execution.agents.planner(execution.prompt);
+      recordAgent('success');
       
       execution.plan = planResult.content;
+      
+      const duration = Date.now() - startTime;
+      executionDuration.observe({ phase: 'planning', status: 'success' }, duration / 1000);
+      
+      logPerformance(phaseLogger, 'planning_phase', duration, {
+        planLength: execution.plan.length,
+        tokens: planResult.tokenCount || 0
+      });
       
       this.emitEvent(sessionId, "planning_complete", { 
         plan: execution.plan,
         tokens: planResult.tokenCount || 0
       });
 
-      console.log(`[Orchestrator] Plan created: ${execution.plan.substring(0, 100)}...`);
+      phaseLogger.info({
+        type: 'planning_complete',
+        planLength: execution.plan.length,
+        duration_ms: duration
+      }, `Planning completed in ${duration}ms`);
       
       return execution.plan;
     } catch (error) {
+      const duration = Date.now() - startTime;
+      executionDuration.observe({ phase: 'planning', status: 'failed' }, duration / 1000);
+      
       this.emitEvent(sessionId, "planning_failed", { error: error.message });
+      
+      logError(phaseLogger, error, {
+        type: 'planning_failed',
+        duration_ms: duration
+      });
+      
       throw new Error(`Planning failed: ${error.message}`);
     }
   }
@@ -162,8 +213,12 @@ class ExecutionOrchestrator {
    */
   async executeBuildLoop(sessionId) {
     const execution = this.executions.get(sessionId);
+    const sessionLogger = execution.logger;
     
-    console.log(`[Orchestrator] Build loop for session ${sessionId}`);
+    sessionLogger.info({
+      type: 'build_loop_start',
+      maxIterations: MAX_ITERATIONS
+    }, `Starting build loop (max ${MAX_ITERATIONS} iterations)`);
 
     for (let i = 0; i < MAX_ITERATIONS; i++) {
       execution.currentIteration = i + 1;
@@ -180,7 +235,11 @@ class ExecutionOrchestrator {
       execution.iterations.push(iteration);
       this.metrics.iterations++;
 
-      console.log(`[Orchestrator] Iteration ${i + 1}/${MAX_ITERATIONS} for session ${sessionId}`);
+      sessionLogger.info({
+        type: 'iteration_start',
+        iteration: i + 1,
+        maxIterations: MAX_ITERATIONS
+      }, `Starting iteration ${i + 1}/${MAX_ITERATIONS}`);
 
       // Build phase
       const buildSuccess = await this.executeBuild(sessionId, iteration);
@@ -190,28 +249,56 @@ class ExecutionOrchestrator {
         this.transitionTo(sessionId, States.SUCCESS);
         this.metrics.completed++;
         
+        const totalDuration = Date.now() - execution.startTime;
+        executionDuration.observe({ phase: 'total', status: 'success' }, totalDuration / 1000);
+        
         this.emitEvent(sessionId, "execution_complete", {
           iterations: i + 1,
-          duration: Date.now() - execution.startTime,
+          duration: totalDuration,
           code: execution.code
         });
+        
+        sessionLogger.info({
+          type: 'build_loop_success',
+          iterations: i + 1,
+          duration_ms: totalDuration
+        }, `Build loop completed successfully after ${i + 1} iterations`);
         
         return;
       }
 
       // Build failed, try to fix
       if (i < MAX_ITERATIONS - 1) {
+        // Record retry
+        recordRetry(i + 1, 'failed');
+        
+        sessionLogger.warn({
+          type: 'iteration_failed',
+          iteration: i + 1,
+          errorCount: iteration.errors.length
+        }, `Iteration ${i + 1} failed, attempting fix`);
+        
         await this.executeFix(sessionId, iteration);
       } else {
         // Max iterations reached
         this.transitionTo(sessionId, States.FAILED);
         this.metrics.failed++;
         
+        const totalDuration = Date.now() - execution.startTime;
+        executionDuration.observe({ phase: 'total', status: 'failed' }, totalDuration / 1000);
+        
         this.emitEvent(sessionId, "execution_failed", {
           reason: "max_iterations",
           iterations: MAX_ITERATIONS,
           errors: execution.errors
         });
+        
+        sessionLogger.error({
+          type: 'build_loop_failed',
+          reason: 'max_iterations',
+          iterations: MAX_ITERATIONS,
+          errorCount: execution.errors.length
+        }, `Build loop failed after ${MAX_ITERATIONS} iterations`);
       }
     }
   }
@@ -221,6 +308,8 @@ class ExecutionOrchestrator {
    */
   async executeBuild(sessionId, iteration) {
     const execution = this.executions.get(sessionId);
+    const phaseLogger = createExecutionLogger(sessionId, `building-${iteration.number}`);
+    const startTime = Date.now();
     
     this.transitionTo(sessionId, States.BUILDING);
     this.emitEvent(sessionId, "building_start", { 
@@ -228,7 +317,10 @@ class ExecutionOrchestrator {
       plan: execution.plan 
     });
 
-    console.log(`[Orchestrator] Building (iteration ${iteration.number}) for session ${sessionId}`);
+    phaseLogger.info({
+      type: 'building_start',
+      iteration: iteration.number
+    }, `Starting build phase (iteration ${iteration.number})`);
 
     try {
       // Invoke builder agent with approved plan
@@ -236,16 +328,28 @@ class ExecutionOrchestrator {
         ? execution.prompt 
         : `Previous attempt had errors. Fix them and try again.\n\nErrors:\n${iteration.errors.join('\n')}\n\nOriginal request: ${execution.prompt}`;
 
+      const recordAgent = recordAgentInvocation('builder', 'microsoft');
       const buildResult = await execution.agents.builder(buildPrompt, execution.plan);
+      recordAgent('success');
       
       execution.code = buildResult.content;
       iteration.result = buildResult;
+      
+      const buildDuration = Date.now() - startTime;
+      executionDuration.observe({ phase: 'building', status: 'success' }, buildDuration / 1000);
       
       this.emitEvent(sessionId, "building_complete", {
         iteration: iteration.number,
         tokens: buildResult.tokenCount || 0,
         codeLength: execution.code.length
       });
+
+      phaseLogger.info({
+        type: 'building_complete',
+        iteration: iteration.number,
+        codeLength: execution.code.length,
+        duration_ms: buildDuration
+      }, `Build completed in ${buildDuration}ms`);
 
       // Write code to sandbox
       await this.writeCodeToSandbox(sessionId, execution.code);
@@ -265,6 +369,13 @@ class ExecutionOrchestrator {
       
       if (testResult.success) {
         iteration.state = "success";
+        
+        phaseLogger.info({
+          type: 'build_success',
+          iteration: iteration.number,
+          duration_ms: Date.now() - startTime
+        }, `Build iteration ${iteration.number} succeeded`);
+        
         return true;
       } else {
         iteration.state = "error";
@@ -276,9 +387,19 @@ class ExecutionOrchestrator {
           errors: testResult.errors
         });
         
+        phaseLogger.warn({
+          type: 'build_errors',
+          iteration: iteration.number,
+          errorCount: testResult.errors.length,
+          errors: testResult.errors
+        }, `Build iteration ${iteration.number} has ${testResult.errors.length} errors`);
+        
         return false;
       }
     } catch (error) {
+      const duration = Date.now() - startTime;
+      executionDuration.observe({ phase: 'building', status: 'failed' }, duration / 1000);
+      
       iteration.state = "error";
       iteration.errors = [error.message];
       execution.errors.push(error.message);
@@ -286,6 +407,12 @@ class ExecutionOrchestrator {
       this.emitEvent(sessionId, "building_failed", {
         iteration: iteration.number,
         error: error.message
+      });
+      
+      logError(phaseLogger, error, {
+        type: 'building_failed',
+        iteration: iteration.number,
+        duration_ms: duration
       });
       
       return false;
@@ -297,6 +424,8 @@ class ExecutionOrchestrator {
    */
   async executeFix(sessionId, iteration) {
     const execution = this.executions.get(sessionId);
+    const phaseLogger = createExecutionLogger(sessionId, `fixing-${iteration.number}`);
+    const startTime = Date.now();
     
     this.transitionTo(sessionId, States.FIXING);
     this.emitEvent(sessionId, "fixing_start", {
@@ -304,27 +433,58 @@ class ExecutionOrchestrator {
       errors: iteration.errors
     });
 
-    console.log(`[Orchestrator] Fixing (iteration ${iteration.number}) for session ${sessionId}`);
+    phaseLogger.info({
+      type: 'fixing_start',
+      iteration: iteration.number,
+      errorCount: iteration.errors.length
+    }, `Starting fix phase (iteration ${iteration.number})`);
 
     try {
       // Invoke fixer agent
       const fixPrompt = `The code has errors. Analyze and fix them.\n\nErrors:\n${iteration.errors.join('\n')}\n\nOriginal code:\n${execution.code}`;
       
+      const recordAgent = recordAgentInvocation('fixer', 'microsoft');
       const fixResult = await execution.agents.fixer(fixPrompt);
+      recordAgent('success');
+      
+      const duration = Date.now() - startTime;
+      executionDuration.observe({ phase: 'fixing', status: 'success' }, duration / 1000);
       
       this.emitEvent(sessionId, "fixing_complete", {
         iteration: iteration.number,
         tokens: fixResult.tokenCount || 0
       });
 
-      console.log(`[Orchestrator] Fix applied for iteration ${iteration.number}`);
+      recordFixerResult('fixed');
+      
+      logPerformance(phaseLogger, 'fixing_phase', duration, {
+        iteration: iteration.number,
+        tokens: fixResult.tokenCount || 0
+      });
+
+      phaseLogger.info({
+        type: 'fixing_complete',
+        iteration: iteration.number,
+        duration_ms: duration
+      }, `Fix applied for iteration ${iteration.number}`);
       
       // The next iteration will use the fixed approach
       return true;
     } catch (error) {
+      const duration = Date.now() - startTime;
+      executionDuration.observe({ phase: 'fixing', status: 'failed' }, duration / 1000);
+      
+      recordFixerResult('failed');
+      
       this.emitEvent(sessionId, "fixing_failed", {
         iteration: iteration.number,
         error: error.message
+      });
+      
+      logError(phaseLogger, error, {
+        type: 'fixing_failed',
+        iteration: iteration.number,
+        duration_ms: duration
       });
       
       return false;
@@ -335,7 +495,13 @@ class ExecutionOrchestrator {
    * Write code to sandbox
    */
   async writeCodeToSandbox(sessionId, code) {
-    console.log(`[Orchestrator] Writing code to sandbox for session ${sessionId}`);
+    const execution = this.executions.get(sessionId);
+    const sessionLogger = execution.logger;
+    
+    sessionLogger.debug({
+      type: 'write_code_start',
+      codeLength: code.length
+    }, 'Writing code to sandbox');
     
     // Extract files from code (look for code blocks with file paths)
     const fileRegex = /```[\w]*\n\/\/ filepath: (.+?)\n([\s\S]*?)```/g;
@@ -349,13 +515,24 @@ class ExecutionOrchestrator {
       try {
         await sandboxManager.writeFile(sessionId, filepath, content);
         filesWritten++;
-        console.log(`[Orchestrator] Wrote file: ${filepath}`);
+        
+        sessionLogger.debug({
+          type: 'file_written',
+          filepath,
+          size: content.length
+        }, `Wrote file: ${filepath}`);
       } catch (error) {
-        console.error(`[Orchestrator] Failed to write ${filepath}: ${error.message}`);
+        logError(sessionLogger, error, {
+          type: 'file_write_failed',
+          filepath
+        });
       }
     }
 
-    console.log(`[Orchestrator] Wrote ${filesWritten} files to sandbox`);
+    sessionLogger.info({
+      type: 'write_code_complete',
+      filesWritten
+    }, `Wrote ${filesWritten} files to sandbox`);
     
     return filesWritten;
   }
@@ -364,7 +541,12 @@ class ExecutionOrchestrator {
    * Test code in sandbox
    */
   async testCode(sessionId) {
-    console.log(`[Orchestrator] Testing code for session ${sessionId}`);
+    const execution = this.executions.get(sessionId);
+    const sessionLogger = execution.logger;
+    
+    sessionLogger.debug({
+      type: 'test_code_start'
+    }, 'Testing code in sandbox');
     
     const errors = [];
 
@@ -374,6 +556,10 @@ class ExecutionOrchestrator {
       
       if (pkgResult.output.includes('found')) {
         this.emitEvent(sessionId, "installing_dependencies", { message: "Installing npm packages..." });
+        
+        sessionLogger.info({
+          type: 'installing_dependencies'
+        }, 'Installing npm dependencies');
         
         const installResult = await sandboxManager.execInContainer(sessionId, "npm install --production", 120000);
         
@@ -388,6 +574,11 @@ class ExecutionOrchestrator {
       if (jsFiles.success && jsFiles.output) {
         const files = jsFiles.output.split('\n').filter(f => f.trim());
         
+        sessionLogger.debug({
+          type: 'syntax_check_start',
+          fileCount: files.length
+        }, `Checking syntax for ${files.length} files`);
+        
         for (const file of files.slice(0, 10)) { // Check first 10 files
           const syntaxCheck = await sandboxManager.execInContainer(sessionId, `node --check ${file}`);
           
@@ -397,11 +588,23 @@ class ExecutionOrchestrator {
         }
       }
 
+      const success = errors.length === 0;
+      
+      sessionLogger.info({
+        type: 'test_code_complete',
+        success,
+        errorCount: errors.length
+      }, success ? 'Code tests passed' : `Code tests failed with ${errors.length} errors`);
+
       return {
-        success: errors.length === 0,
+        success,
         errors
       };
     } catch (error) {
+      logError(sessionLogger, error, {
+        type: 'test_code_failed'
+      });
+      
       return {
         success: false,
         errors: [error.message]
@@ -420,7 +623,12 @@ class ExecutionOrchestrator {
     const oldState = execution.state;
     execution.state = newState;
 
-    console.log(`[Orchestrator] State transition: ${oldState} → ${newState} (session ${sessionId})`);
+    execution.logger.info({
+      type: 'state_transition',
+      from: oldState,
+      to: newState,
+      ...data
+    }, `State transition: ${oldState} → ${newState}`);
 
     this.emitEvent(sessionId, "state_change", {
       from: oldState,
@@ -445,7 +653,11 @@ class ExecutionOrchestrator {
 
     execution.events.push(event);
 
-    console.log(`[Orchestrator] Event: ${type} (session ${sessionId})`);
+    execution.logger.debug({
+      type: 'event_emitted',
+      eventType: type,
+      eventData: data
+    }, `Event: ${type}`);
 
     // If there's a callback, call it
     if (execution.options.onEvent) {
@@ -457,17 +669,24 @@ class ExecutionOrchestrator {
    * Handle timeout
    */
   async handleTimeout(sessionId) {
-    console.log(`[Orchestrator] Timeout for session ${sessionId}`);
-    
     const execution = this.executions.get(sessionId);
     
     if (!execution) return;
+
+    const sessionLogger = execution.logger;
+    const duration = Date.now() - execution.startTime;
+    
+    sessionLogger.error({
+      type: 'execution_timeout',
+      duration_ms: duration,
+      iterations: execution.currentIteration
+    }, `Execution timeout after ${Math.round(duration / 1000)}s`);
 
     this.transitionTo(sessionId, States.TIMEOUT);
     this.metrics.failed++;
 
     this.emitEvent(sessionId, "execution_timeout", {
-      duration: Date.now() - execution.startTime,
+      duration,
       iterations: execution.currentIteration
     });
 
@@ -479,13 +698,24 @@ class ExecutionOrchestrator {
    * Stop execution
    */
   async stopExecution(sessionId, reason = "manual") {
-    console.log(`[Orchestrator] Stopping execution for session ${sessionId} (reason: ${reason})`);
-    
     const execution = this.executions.get(sessionId);
     
     if (!execution) {
+      logger.warn({
+        type: 'stop_execution_failed',
+        sessionId,
+        reason: 'not_found'
+      }, `Cannot stop execution - not found for session ${sessionId}`);
       return { success: false, error: "Execution not found" };
     }
+
+    const sessionLogger = execution.logger;
+    
+    sessionLogger.warn({
+      type: 'stop_execution',
+      reason,
+      duration_ms: Date.now() - execution.startTime
+    }, `Stopping execution (reason: ${reason})`);
 
     // Clear timeout
     if (execution.timeout) {
@@ -584,6 +814,10 @@ class ExecutionOrchestrator {
     const execution = this.executions.get(sessionId);
     
     if (!execution) return;
+
+    execution.logger.debug({
+      type: 'cleanup_execution'
+    }, 'Cleaning up execution');
 
     if (execution.timeout) {
       clearTimeout(execution.timeout);

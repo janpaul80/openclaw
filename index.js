@@ -6,6 +6,8 @@ import autonomousLoop from "./autonomousLoop.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import logger, { createLogger, createSessionLogger } from "./logger.js";
+import { getMetrics, updateSandboxHealth } from "./metrics.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -27,24 +29,28 @@ if (process.env.SSH_PRIVATE_KEY) {
     // Create .ssh directory if it doesn't exist
     if (!fs.existsSync(sshDir)) {
       fs.mkdirSync(sshDir, { recursive: true, mode: 0o700 });
-      console.log(`[SSH] Created directory: ${sshDir}`);
+      logger.info({ type: 'ssh_init', sshDir }, 'Created SSH directory');
     }
     
     // Decode base64 private key and write to file
     const keyContent = Buffer.from(process.env.SSH_PRIVATE_KEY, "base64").toString("utf8");
     fs.writeFileSync(keyPath, keyContent, { mode: 0o600 });
     
-    console.log(`[SSH] Private key written to: ${keyPath}`);
-    console.log(`[SSH] Key permissions: 600 (read/write owner only)`);
-    console.log(`[SSH] SSH directory permissions: 700`);
-    console.log(`[SSH] ✓ SSH configuration complete`);
+    logger.info({ 
+      type: 'ssh_init', 
+      keyPath, 
+      keyPermissions: '600',
+      dirPermissions: '700'
+    }, 'SSH configuration complete');
   } catch (error) {
-    console.error(`[SSH] ✗ Error configuring SSH key: ${error.message}`);
-    console.error(`[SSH] Sandbox functionality may be unavailable`);
+    logger.error({ 
+      type: 'ssh_init', 
+      error: error.message,
+      stack: error.stack
+    }, 'Error configuring SSH key - sandbox functionality may be unavailable');
   }
 } else {
-  console.warn(`[SSH] ⚠ SSH_PRIVATE_KEY environment variable not set`);
-  console.warn(`[SSH] Sandbox functionality will be unavailable`);
+  logger.warn({ type: 'ssh_init' }, 'SSH_PRIVATE_KEY environment variable not set - sandbox functionality will be unavailable');
 }
 
 // ============================================================
@@ -103,11 +109,15 @@ function getProviderForRole(role) {
 // ============================================================
 // Startup Logging
 // ============================================================
-console.log("========================================");
-console.log("OpenClaw Orchestrator v4.0.0 Starting...");
-console.log("  PHASE 1: Autonomous Build Loop");
-console.log("  DUAL PROVIDER Architecture");
-console.log("========================================");
+logger.info({
+  type: 'startup',
+  version: '4.0.0',
+  phase: 'Phase 1: Autonomous Build Loop',
+  architecture: 'DUAL PROVIDER',
+  port: PORT,
+  host: HOST,
+  nodeEnv: process.env.NODE_ENV || 'development'
+}, 'OpenClaw Orchestrator starting');
 console.log(`PORT: ${PORT}`);
 console.log(`HOST: ${HOST}`);
 console.log(`NODE_ENV: ${process.env.NODE_ENV || "development"}`);
@@ -122,6 +132,59 @@ console.log(`  Roles: ${QWEN_ROLES.join(", ")}`);
 console.log("========================================");
 
 app.use(express.json({ limit: "10mb" }));
+
+// ============================================================
+// OBSERVABILITY MIDDLEWARE
+// ============================================================
+
+// Correlation ID middleware - adds unique ID to each request
+app.use((req, res, next) => {
+  const correlationId = req.headers['x-correlation-id'] || 
+                        `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  req.correlationId = correlationId;
+  req.logger = createLogger(correlationId);
+  res.setHeader('X-Correlation-ID', correlationId);
+  next();
+});
+
+// Request logging middleware
+app.use((req, res, next) => {
+  const startTime = Date.now();
+  
+  req.logger.info({
+    type: 'http_request',
+    method: req.method,
+    path: req.path,
+    ip: req.ip,
+    userAgent: req.headers['user-agent'],
+  }, 'Incoming request');
+  
+  // Log response
+  res.on('finish', () => {
+    const duration = Date.now() - startTime;
+    req.logger.info({
+      type: 'http_response',
+      method: req.method,
+      path: req.path,
+      statusCode: res.statusCode,
+      duration_ms: duration,
+    }, `Request completed in ${duration}ms`);
+  });
+  
+  next();
+});
+
+// Metrics endpoint
+app.get('/metrics', async (req, res) => {
+  try {
+    res.set('Content-Type', 'text/plain; version=0.0.4');
+    const metrics = await getMetrics();
+    res.send(metrics);
+  } catch (error) {
+    logger.error({ type: 'metrics_error', error: error.message }, 'Error generating metrics');
+    res.status(500).send('Error generating metrics');
+  }
+});
 
 // ============================================================
 // Agent System Prompts (for Qwen execution agents only)

@@ -8,7 +8,9 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "pino": "^8.16.0",
+    "prom-client": "^15.0.0"
   },
   "engines": {
     "node": ">=20.0.0"

@@ -10,6 +10,8 @@
  */
 
 import orchestrator from "./orchestrator.js";
+import logger, { createSessionLogger, logError, logPerformance } from "./logger.js";
+import { recordExecutionStart, recordRetry, recordFixerResult } from "./metrics.js";
 
 // ============================================================
 // AUTONOMOUS LOOP
@@ -30,8 +32,15 @@ class AutonomousLoop {
    * Start autonomous build loop
    */
   async start(sessionId, prompt, agentInvokers, options = {}) {
-    console.log(`[AutonomousLoop] Starting loop for session ${sessionId}`);
-    console.log(`[AutonomousLoop] Prompt: ${prompt.substring(0, 100)}...`);
+    const sessionLogger = createSessionLogger(sessionId);
+    const recordExecution = recordExecutionStart(sessionId);
+    const startTime = Date.now();
+
+    sessionLogger.info({
+      type: 'loop_start',
+      prompt: prompt.substring(0, 200),
+      promptLength: prompt.length
+    }, `Starting autonomous loop for session ${sessionId}`);
 
     if (this.sessions.has(sessionId)) {
       throw new Error(`Loop already running for session ${sessionId}`);
@@ -40,10 +49,11 @@ class AutonomousLoop {
     const loop = {
       sessionId,
       prompt,
-      startTime: Date.now(),
+      startTime,
       status: "running",
       events: [],
-      result: null
+      result: null,
+      logger: sessionLogger
     };
 
     this.sessions.set(sessionId, loop);
@@ -52,23 +62,41 @@ class AutonomousLoop {
     // Create agent wrappers
     const agents = {
       planner: async (prompt) => {
-        console.log(`[AutonomousLoop] Invoking planner for session ${sessionId}`);
+        sessionLogger.info({
+          type: 'agent_invoke',
+          agent: 'planner',
+          promptLength: prompt.length
+        }, 'Invoking planner agent');
         return await agentInvokers.planner(prompt);
       },
       
       builder: async (prompt, plan) => {
-        console.log(`[AutonomousLoop] Invoking builder for session ${sessionId}`);
+        sessionLogger.info({
+          type: 'agent_invoke',
+          agent: 'builder',
+          promptLength: prompt.length,
+          hasPlan: !!plan
+        }, 'Invoking builder agent');
         return await agentInvokers.builder(prompt, plan);
       },
       
       fixer: async (prompt) => {
-        console.log(`[AutonomousLoop] Invoking fixer for session ${sessionId}`);
+        sessionLogger.info({
+          type: 'agent_invoke',
+          agent: 'fixer',
+          promptLength: prompt.length
+        }, 'Invoking fixer agent');
         return await agentInvokers.fixer(prompt);
       }
     };
 
     // Start orchestrated execution
     try {
+      sessionLogger.info({
+        type: 'execution_start',
+        phase: 'orchestration'
+      }, 'Starting orchestrated execution');
+
       const execution = await orchestrator.startExecution(
         sessionId,
         prompt,
@@ -76,6 +104,15 @@ class AutonomousLoop {
         {
           onEvent: (event) => {
             loop.events.push(event);
+            
+            // Log important events
+            if (['planning_complete', 'building_complete', 'fixing_complete', 'execution_complete'].includes(event.type)) {
+              sessionLogger.info({
+                type: 'execution_event',
+                event: event.type,
+                data: event.data
+              }, `Execution event: ${event.type}`);
+            }
             
             // Forward events to callback if provided
             if (options.onEvent) {
@@ -86,10 +123,16 @@ class AutonomousLoop {
       );
 
       // Wait for completion
+      sessionLogger.debug({
+        type: 'waiting_completion',
+        timeout: options.timeout || 900000
+      }, 'Waiting for execution completion');
+
       await this.waitForCompletion(sessionId, options.timeout || 900000);
 
       // Get final result
       const details = orchestrator.getDetails(sessionId);
+      const duration = Date.now() - loop.startTime;
       
       if (details && details.state === "success") {
         loop.status = "success";
@@ -98,44 +141,70 @@ class AutonomousLoop {
           code: details.code,
           plan: details.plan,
           iterations: details.currentIteration,
-          duration: Date.now() - loop.startTime,
+          duration,
           snapshots: details.snapshots
         };
         
         this.metrics.successful++;
         this.updateAvgIterations(details.currentIteration);
         
-        console.log(`[AutonomousLoop] Loop completed successfully for session ${sessionId} (${details.currentIteration} iterations)`);
+        recordExecution('success', 'completed');
+        logPerformance(sessionLogger, 'autonomous_loop', duration, {
+          iterations: details.currentIteration,
+          snapshots: details.snapshots.length
+        });
+        
+        sessionLogger.info({
+          type: 'loop_success',
+          iterations: details.currentIteration,
+          duration_ms: duration,
+          duration_s: Math.round(duration / 1000)
+        }, `Loop completed successfully (${details.currentIteration} iterations, ${Math.round(duration / 1000)}s)`);
       } else {
         loop.status = "failed";
         loop.result = {
           success: false,
           error: details ? details.errors.join('; ') : 'Unknown error',
           iterations: details ? details.currentIteration : 0,
-          duration: Date.now() - loop.startTime
+          duration
         };
         
         this.metrics.failed++;
         
-        console.log(`[AutonomousLoop] Loop failed for session ${sessionId}`);
+        recordExecution('failed', 'completed');
+        
+        sessionLogger.warn({
+          type: 'loop_failed',
+          error: loop.result.error,
+          iterations: loop.result.iterations,
+          duration_ms: duration
+        }, `Loop failed after ${loop.result.iterations} iterations`);
       }
 
       return loop.result;
     } catch (error) {
+      const duration = Date.now() - loop.startTime;
       loop.status = "error";
       loop.result = {
         success: false,
         error: error.message,
-        duration: Date.now() - loop.startTime
+        duration
       };
       
       this.metrics.failed++;
+      recordExecution('error', 'failed');
       
-      console.error(`[AutonomousLoop] Loop error for session ${sessionId}: ${error.message}`);
+      logError(sessionLogger, error, {
+        type: 'loop_error',
+        duration_ms: duration
+      });
       
       return loop.result;
     } finally {
       // Cleanup
+      sessionLogger.debug({
+        type: 'cleanup_start'
+      }, 'Starting cleanup');
       await orchestrator.cleanup(sessionId);
     }
   }
@@ -171,13 +240,24 @@ class AutonomousLoop {
    * Stop autonomous loop
    */
   async stop(sessionId, reason = "manual") {
-    console.log(`[AutonomousLoop] Stopping loop for session ${sessionId} (reason: ${reason})`);
-
     const loop = this.sessions.get(sessionId);
     
     if (!loop) {
+      logger.warn({
+        type: 'loop_stop_failed',
+        sessionId,
+        reason: 'not_found'
+      }, `Cannot stop loop - not found for session ${sessionId}`);
       return { success: false, error: "Loop not found" };
     }
+
+    const sessionLogger = loop.logger || createSessionLogger(sessionId);
+    
+    sessionLogger.warn({
+      type: 'loop_stop',
+      reason,
+      duration_ms: Date.now() - loop.startTime
+    }, `Stopping loop (reason: ${reason})`);
 
     // Stop orchestrator
     await orchestrator.stopExecution(sessionId, reason);
