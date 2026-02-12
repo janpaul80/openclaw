@@ -3,10 +3,49 @@ import express from "express";
 import sandboxManager from "./sandboxManager.js";
 import orchestrator from "./orchestrator.js";
 import autonomousLoop from "./autonomousLoop.js";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const HOST = "0.0.0.0";
+
+// ============================================================
+// SSH KEY INITIALIZATION (for VPS sandbox access)
+// ============================================================
+// Write SSH private key from environment variable to filesystem
+// This enables OpenClaw to SSH into VPS for Docker container management
+if (process.env.SSH_PRIVATE_KEY) {
+  try {
+    const sshDir = path.join(process.env.HOME || "/root", ".ssh");
+    const keyPath = path.join(sshDir, "id_rsa");
+    
+    // Create .ssh directory if it doesn't exist
+    if (!fs.existsSync(sshDir)) {
+      fs.mkdirSync(sshDir, { recursive: true, mode: 0o700 });
+      console.log(`[SSH] Created directory: ${sshDir}`);
+    }
+    
+    // Decode base64 private key and write to file
+    const keyContent = Buffer.from(process.env.SSH_PRIVATE_KEY, "base64").toString("utf8");
+    fs.writeFileSync(keyPath, keyContent, { mode: 0o600 });
+    
+    console.log(`[SSH] Private key written to: ${keyPath}`);
+    console.log(`[SSH] Key permissions: 600 (read/write owner only)`);
+    console.log(`[SSH] SSH directory permissions: 700`);
+    console.log(`[SSH] ✓ SSH configuration complete`);
+  } catch (error) {
+    console.error(`[SSH] ✗ Error configuring SSH key: ${error.message}`);
+    console.error(`[SSH] Sandbox functionality may be unavailable`);
+  }
+} else {
+  console.warn(`[SSH] ⚠ SSH_PRIVATE_KEY environment variable not set`);
+  console.warn(`[SSH] Sandbox functionality will be unavailable`);
+}
 
 // ============================================================
 // DUAL PROVIDER CONFIGURATION

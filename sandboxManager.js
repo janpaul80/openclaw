@@ -20,8 +20,8 @@ const execAsync = promisify(exec);
 // ============================================================
 
 const VPS_HOST = process.env.VPS_HOST || "87.106.111.220";
-const VPS_USER = process.env.VPS_USER || "root";
-const VPS_SSH_KEY = process.env.VPS_SSH_KEY || "~/.ssh/id_rsa";
+const VPS_USER = process.env.VPS_USER || "openclaw";
+const VPS_SSH_KEY = process.env.VPS_SSH_KEY || "/root/.ssh/id_rsa";
 
 // Conservative limits
 const MAX_CONCURRENT_CONTAINERS = parseInt(process.env.MAX_CONCURRENT_CONTAINERS || "3");
