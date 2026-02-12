@@ -6,11 +6,11 @@ WORKDIR /app
 RUN apk add --no-cache openssh-client
 
 # Copy package files and install production deps
-COPY package.json ./
+COPY package.json package-lock.json ./
 RUN npm install --production
 
 # Copy application code
-COPY index.js orchestrator.js sandboxManager.js autonomousLoop.js ./
+COPY index.js orchestrator.js sandboxManager.js autonomousLoop.js logger.js metrics.js ./
 
 # Set environment
 ENV NODE_ENV=production
