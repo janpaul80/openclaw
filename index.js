@@ -65,7 +65,8 @@ function getProviderForRole(role) {
 // Startup Logging
 // ============================================================
 console.log("========================================");
-console.log("OpenClaw Orchestrator v3.2.0 Starting...");
+console.log("OpenClaw Orchestrator v4.0.0 Starting...");
+console.log("  PHASE 1: Autonomous Build Loop");
 console.log("  DUAL PROVIDER Architecture");
 console.log("========================================");
 console.log(`PORT: ${PORT}`);
@@ -872,13 +873,15 @@ app.get("/debug/network", async (req, res) => {
 // Health check
 app.get("/health", async (req, res) => {
   const ollamaHealth = await checkOllamaHealth();
+  const sandboxHealth = await sandboxManager.healthCheck();
   const uptime = process.uptime();
 
   res.json({
     status: isMicrosoftConfigured() ? "ok" : "degraded",
     service: "openclaw",
-    version: "3.2.0",
-    architecture: "dual-provider",
+    version: "4.0.0",
+    architecture: "autonomous-build-loop",
+    phase: "1",
     uptime,
     timestamp: new Date().toISOString(),
     providers: {
@@ -892,6 +895,13 @@ app.get("/health", async (req, res) => {
         roles: QWEN_ROLES,
         ...ollamaHealth
       }
+    },
+    sandbox: {
+      healthy: sandboxHealth.healthy,
+      vpsHost: sandboxHealth.vpsHost,
+      connectionMethod: sandboxHealth.connectionMethod,
+      dockerVersion: sandboxHealth.dockerVersion || null,
+      error: sandboxHealth.error || null
     },
     activeSessions: sessions.size,
     agents: [...MICROSOFT_ROLES, ...QWEN_ROLES]
