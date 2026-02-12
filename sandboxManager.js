@@ -12,15 +12,6 @@
 
 import { exec } from "child_process";
 import { promisify } from "util";
-import logger, { createContainerLogger, logError, logPerformance } from "./logger.js";
-import {
-  recordSandboxCreation,
-  recordSandboxCleanup,
-  recordSandboxError,
-  updateSandboxHealth,
-  activeSandboxContainers,
-  updateVPSResources
-} from "./metrics.js";
 
 const execAsync = promisify(exec);
 
@@ -64,51 +55,22 @@ class SandboxManager {
    */
   async dockerExec(command, timeout = 30000) {
     const sshCommand = `ssh -i ${VPS_SSH_KEY} -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VPS_USER}@${VPS_HOST} "docker ${command}"`;
-    const startTime = Date.now();
-
-    logger.debug({
-      type: 'docker_exec',
-      command: command.substring(0, 100),
-      vpsHost: VPS_HOST,
-      timeout
-    }, 'Executing Docker command via SSH');
-
+    
+    console.log(`[SandboxManager] SSH Docker: ${command.substring(0, 100)}...`);
+    
     try {
       const { stdout, stderr } = await execAsync(sshCommand, {
         timeout,
         maxBuffer: 10 * 1024 * 1024 // 10MB buffer
       });
-
-      const duration = Date.now() - startTime;
-      logPerformance(logger, 'docker_exec', duration, { command: command.substring(0, 50) });
-
+      
       if (stderr && !stderr.includes("WARNING")) {
-        logger.warn({
-          type: 'docker_stderr',
-          stderr: stderr.substring(0, 200)
-        }, 'Docker command produced stderr output');
+        console.warn(`[SandboxManager] Docker stderr: ${stderr}`);
       }
-
+      
       return stdout.trim();
     } catch (error) {
-      const duration = Date.now() - startTime;
-      logError(logger, error, {
-        type: 'docker_exec_failed',
-        command: command.substring(0, 100),
-        duration_ms: duration
-      });
-      
-      // Categorize error type for metrics
-      if (error.message.includes('Permission denied')) {
-        recordSandboxError('permission_denied');
-      } else if (error.message.includes('timeout')) {
-        recordSandboxError('timeout');
-      } else if (error.message.includes('ssh')) {
-        recordSandboxError('ssh_failed');
-      } else {
-        recordSandboxError('docker_failed');
-      }
-      
+      console.error(`[SandboxManager] Docker command failed: ${error.message}`);
       throw new Error(`Docker SSH command failed: ${error.message}`);
     }
   }
@@ -126,26 +88,13 @@ class SandboxManager {
    * Create a new sandbox container
    */
   async createContainer(sessionId, options = {}) {
-    const containerLogger = createContainerLogger(`pending-${sessionId}`, sessionId);
-    const recordCreation = recordSandboxCreation(sessionId);
-    const startTime = Date.now();
+    console.log(`[SandboxManager] Creating container for session ${sessionId}`);
     
-    containerLogger.info({
-      type: 'container_create_start',
-      sessionId,
-      options
-    }, 'Starting container creation');
-
     // Check concurrency limit
     if (!this.canCreateContainer()) {
-      containerLogger.warn({
-        type: 'container_queued',
-        currentContainers: this.containers.size,
-        maxContainers: MAX_CONCURRENT_CONTAINERS
-      }, 'Concurrency limit reached, queueing request');
-      
+      console.log(`[SandboxManager] Concurrency limit reached (${MAX_CONCURRENT_CONTAINERS}), queueing request`);
       this.metrics.queued++;
-
+      
       return new Promise((resolve, reject) => {
         this.queue.push({ sessionId, options, resolve, reject });
       });
@@ -153,7 +102,7 @@ class SandboxManager {
 
     const containerName = `openclaw-${sessionId}`;
     const workdir = `/workspace/${sessionId}`;
-
+    
     try {
       // Security: Drop all capabilities, read-only root, no privileged mode
       const createCmd = [
@@ -161,6 +110,7 @@ class SandboxManager {
         `--name ${containerName}`,
         `--cpus=${CONTAINER_CPU_LIMIT}`,
         `--memory=${CONTAINER_MEMORY_LIMIT}`,
+        `--storage-opt size=${CONTAINER_DISK_LIMIT}`,
         "--read-only",
         "--tmpfs /tmp:rw,noexec,nosuid,size=1g",
         `--tmpfs ${workdir}:rw,exec,nosuid,size=5g`,
@@ -175,7 +125,7 @@ class SandboxManager {
       ].join(" ");
 
       const containerId = await this.dockerExec(createCmd, 60000);
-
+      
       const container = {
         id: containerId,
         sessionId,
@@ -194,22 +144,7 @@ class SandboxManager {
       this.containers.set(sessionId, container);
       this.metrics.created++;
 
-      const duration = Date.now() - startTime;
-      recordCreation('success');
-      activeSandboxContainers.set(this.containers.size);
-      
-      containerLogger.info({
-        type: 'container_created',
-        containerId: containerId.substring(0, 12),
-        containerName,
-        duration_ms: duration,
-        workdir,
-        limits: {
-          cpu: CONTAINER_CPU_LIMIT,
-          memory: CONTAINER_MEMORY_LIMIT,
-          disk: CONTAINER_DISK_LIMIT
-        }
-      }, `Container created in ${duration}ms`);
+      console.log(`[SandboxManager] Container created: ${containerId.substring(0, 12)} for session ${sessionId}`);
 
       // Set up automatic cleanup after max execution time
       setTimeout(() => {
@@ -222,15 +157,7 @@ class SandboxManager {
       return container;
     } catch (error) {
       this.metrics.failed++;
-      const duration = Date.now() - startTime;
-      recordCreation('failed');
-      
-      logError(containerLogger, error, {
-        type: 'container_create_failed',
-        sessionId,
-        duration_ms: duration
-      });
-      
+      console.error(`[SandboxManager] Failed to create container: ${error.message}`);
       throw error;
     }
   }
@@ -240,7 +167,7 @@ class SandboxManager {
    */
   async execInContainer(sessionId, command, timeout = 60000) {
     const container = this.containers.get(sessionId);
-
+    
     if (!container) {
       throw new Error(`No container found for session ${sessionId}`);
     }
@@ -254,9 +181,9 @@ class SandboxManager {
     try {
       const execCmd = `exec ${container.id} sh -c "${command.replace(/"/g, '\\"')}"`;
       const output = await this.dockerExec(execCmd, timeout);
-
+      
       container.metrics.commandsExecuted++;
-
+      
       return {
         success: true,
         output,
@@ -264,7 +191,7 @@ class SandboxManager {
       };
     } catch (error) {
       container.metrics.errors++;
-
+      
       return {
         success: false,
         output: error.message,
@@ -278,7 +205,7 @@ class SandboxManager {
    */
   async writeFile(sessionId, filepath, content) {
     const container = this.containers.get(sessionId);
-
+    
     if (!container) {
       throw new Error(`No container found for session ${sessionId}`);
     }
@@ -289,12 +216,12 @@ class SandboxManager {
       // Escape content for shell
       const escapedContent = Buffer.from(content).toString('base64');
       const command = `echo '${escapedContent}' | base64 -d > ${filepath}`;
-
+      
       await this.execInContainer(sessionId, command);
       container.metrics.filesCreated++;
-
+      
       console.log(`[SandboxManager] File written: ${filepath} (${content.length} bytes)`);
-
+      
       return { success: true, filepath };
     } catch (error) {
       console.error(`[SandboxManager] Failed to write file: ${error.message}`);
@@ -307,7 +234,7 @@ class SandboxManager {
    */
   async readFile(sessionId, filepath) {
     const container = this.containers.get(sessionId);
-
+    
     if (!container) {
       throw new Error(`No container found for session ${sessionId}`);
     }
@@ -316,13 +243,13 @@ class SandboxManager {
 
     try {
       const result = await this.execInContainer(sessionId, `cat ${filepath}`);
-
+      
       if (!result.success) {
         throw new Error(`Failed to read file: ${result.output}`);
       }
-
+      
       container.metrics.filesRead++;
-
+      
       return {
         success: true,
         content: result.output,
@@ -339,7 +266,7 @@ class SandboxManager {
    */
   async listFiles(sessionId, directory = ".") {
     const container = this.containers.get(sessionId);
-
+    
     if (!container) {
       throw new Error(`No container found for session ${sessionId}`);
     }
@@ -348,11 +275,11 @@ class SandboxManager {
 
     try {
       const result = await this.execInContainer(sessionId, `ls -la ${directory}`);
-
+      
       if (!result.success) {
         throw new Error(`Failed to list files: ${result.output}`);
       }
-
+      
       return {
         success: true,
         files: result.output.split('\n').filter(line => line.trim()),
@@ -369,21 +296,21 @@ class SandboxManager {
    */
   async createSnapshot(sessionId) {
     const container = this.containers.get(sessionId);
-
+    
     if (!container) {
       throw new Error(`No container found for session ${sessionId}`);
     }
 
     const snapshotName = `openclaw-snapshot-${sessionId}-${Date.now()}`;
-
+    
     console.log(`[SandboxManager] Creating snapshot ${snapshotName} from ${container.id.substring(0, 12)}`);
 
     try {
       const commitCmd = `commit ${container.id} ${snapshotName}`;
       const imageId = await this.dockerExec(commitCmd, 120000);
-
+      
       console.log(`[SandboxManager] Snapshot created: ${imageId.substring(0, 12)}`);
-
+      
       return {
         success: true,
         snapshotName,
@@ -401,7 +328,7 @@ class SandboxManager {
    */
   async getResourceUsage(sessionId) {
     const container = this.containers.get(sessionId);
-
+    
     if (!container) {
       throw new Error(`No container found for session ${sessionId}`);
     }
@@ -409,9 +336,9 @@ class SandboxManager {
     try {
       const statsCmd = `stats ${container.id} --no-stream --format "{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}|{{.BlockIO}}"`;
       const stats = await this.dockerExec(statsCmd, 10000);
-
+      
       const [cpu, mem, net, block] = stats.split('|');
-
+      
       return {
         success: true,
         containerId: container.id,
@@ -436,7 +363,7 @@ class SandboxManager {
    */
   async destroyContainer(sessionId, reason = "manual") {
     const container = this.containers.get(sessionId);
-
+    
     if (!container) {
       console.log(`[SandboxManager] No container to destroy for session ${sessionId}`);
       return { success: true, reason: "not_found" };
@@ -448,20 +375,20 @@ class SandboxManager {
       // Force remove container
       const rmCmd = `rm -f ${container.id}`;
       await this.dockerExec(rmCmd, 30000);
-
+      
       container.status = "destroyed";
       this.containers.delete(sessionId);
       this.metrics.destroyed++;
-
+      
       if (reason === "timeout") {
         this.metrics.timeouts++;
       }
-
+      
       console.log(`[SandboxManager] Container destroyed: ${container.id.substring(0, 12)}`);
-
+      
       // Process queue
       this.processQueue();
-
+      
       return {
         success: true,
         containerId: container.id,
@@ -498,17 +425,17 @@ class SandboxManager {
    */
   async cleanupAll() {
     console.log(`[SandboxManager] Cleaning up all containers (${this.containers.size} active)`);
-
+    
     const sessions = Array.from(this.containers.keys());
     const results = await Promise.allSettled(
       sessions.map(sessionId => this.destroyContainer(sessionId, "cleanup"))
     );
-
+    
     const successful = results.filter(r => r.status === "fulfilled").length;
     const failed = results.filter(r => r.status === "rejected").length;
-
+    
     console.log(`[SandboxManager] Cleanup complete: ${successful} destroyed, ${failed} failed`);
-
+    
     return {
       total: sessions.length,
       successful,
@@ -522,7 +449,7 @@ class SandboxManager {
   getStatus() {
     const activeContainers = Array.from(this.containers.values())
       .filter(c => c.status === "running");
-
+    
     return {
       active: activeContainers.length,
       queued: this.queue.length,
@@ -545,7 +472,7 @@ class SandboxManager {
     try {
       // Test SSH connection and Docker availability
       const version = await this.dockerExec("version --format '{{.Server.Version}}'", 10000);
-
+      
       return {
         healthy: true,
         dockerVersion: version,
@@ -572,19 +499,13 @@ const sandboxManager = new SandboxManager();
 
 // Cleanup on process exit
 process.on("SIGTERM", async () => {
-  logger.warn({
-    type: 'shutdown',
-    signal: 'SIGTERM'
-  }, "SIGTERM received, cleaning up containers...");
+  console.log("[SandboxManager] SIGTERM received, cleaning up containers...");
   await sandboxManager.cleanupAll();
   process.exit(0);
 });
 
 process.on("SIGINT", async () => {
-  logger.warn({
-    type: 'shutdown',
-    signal: 'SIGINT'
-  }, "SIGINT received, cleaning up containers...");
+  console.log("[SandboxManager] SIGINT received, cleaning up containers...");
   await sandboxManager.cleanupAll();
   process.exit(0);
 });
@@ -593,39 +514,11 @@ process.on("SIGINT", async () => {
 setInterval(async () => {
   const now = Date.now();
   const staleThreshold = MAX_EXECUTION_TIME + 60000; // 1 minute grace period
-
+  
   for (const [sessionId, container] of sandboxManager.containers) {
     const age = now - container.createdAt;
     if (age > staleThreshold) {
-      logger.warn({
-        type: 'stale_container_cleanup',
-        containerId: container.id.substring(0, 12),
-        sessionId,
-        age_ms: age,
-        age_s: Math.round(age / 1000)
-      }, `Cleaning up stale container (age: ${Math.round(age / 1000)}s)`);
-      await sandboxManager.destroyContainer(sessionId, "stale");
-    }
-  }
-}, 5 * 60 * 1000);
-
-export default sandboxManager;
-ntainer(sessionId, "stale");
-    }
-  }
-}, 5 * 60 * 1000);
-
-export default sandboxManager;
- const age = now - container.createdAt;
-    if (age > staleThreshold) {
       console.log(`[SandboxManager] Cleaning up stale container ${container.id.substring(0, 12)} (age: ${Math.round(age / 1000)}s)`);
-      await sandboxManager.destroyContainer(sessionId, "stale");
-    }
-  }
-}, 5 * 60 * 1000);
-
-export default sandboxManager;
-e container ${container.id.substring(0, 12)} (age: ${Math.round(age / 1000)}s)`);
       await sandboxManager.destroyContainer(sessionId, "stale");
     }
   }
