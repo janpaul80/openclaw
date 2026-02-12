@@ -25,26 +25,34 @@ if (process.env.SSH_PRIVATE_KEY) {
   try {
     const sshDir = path.join(process.env.HOME || "/root", ".ssh");
     const keyPath = path.join(sshDir, "id_rsa");
-    
+
     // Create .ssh directory if it doesn't exist
     if (!fs.existsSync(sshDir)) {
       fs.mkdirSync(sshDir, { recursive: true, mode: 0o700 });
       logger.info({ type: 'ssh_init', sshDir }, 'Created SSH directory');
     }
-    
-    // Decode base64 private key and write to file
-    const keyContent = Buffer.from(process.env.SSH_PRIVATE_KEY, "base64").toString("utf8");
+
+    // Detect if key is base64 encoded or raw text
+    let keyContent = process.env.SSH_PRIVATE_KEY.trim();
+    if (!keyContent.includes("BEGIN") && !keyContent.startsWith("ssh-")) {
+      try {
+        keyContent = Buffer.from(keyContent, "base64").toString("utf8");
+      } catch (e) {
+        logger.warn({ type: 'ssh_init', error: e.message }, 'Failed to decode SSH_PRIVATE_KEY as base64, using as raw text');
+      }
+    }
+
     fs.writeFileSync(keyPath, keyContent, { mode: 0o600 });
-    
-    logger.info({ 
-      type: 'ssh_init', 
-      keyPath, 
-      keyPermissions: '600',
-      dirPermissions: '700'
+
+    logger.info({
+      type: 'ssh_init',
+      keyPath,
+      keySize: keyContent.length,
+      isBase64: !process.env.SSH_PRIVATE_KEY.includes("BEGIN")
     }, 'SSH configuration complete');
   } catch (error) {
-    logger.error({ 
-      type: 'ssh_init', 
+    logger.error({
+      type: 'ssh_init',
       error: error.message,
       stack: error.stack
     }, 'Error configuring SSH key - sandbox functionality may be unavailable');
@@ -139,8 +147,8 @@ app.use(express.json({ limit: "10mb" }));
 
 // Correlation ID middleware - adds unique ID to each request
 app.use((req, res, next) => {
-  const correlationId = req.headers['x-correlation-id'] || 
-                        `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  const correlationId = req.headers['x-correlation-id'] ||
+    `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
   req.correlationId = correlationId;
   req.logger = createLogger(correlationId);
   res.setHeader('X-Correlation-ID', correlationId);
@@ -150,7 +158,7 @@ app.use((req, res, next) => {
 // Request logging middleware
 app.use((req, res, next) => {
   const startTime = Date.now();
-  
+
   req.logger.info({
     type: 'http_request',
     method: req.method,
@@ -158,7 +166,7 @@ app.use((req, res, next) => {
     ip: req.ip,
     userAgent: req.headers['user-agent'],
   }, 'Incoming request');
-  
+
   // Log response
   res.on('finish', () => {
     const duration = Date.now() - startTime;
@@ -170,7 +178,7 @@ app.use((req, res, next) => {
       duration_ms: duration,
     }, `Request completed in ${duration}ms`);
   });
-  
+
   next();
 });
 
@@ -555,10 +563,10 @@ async function invokeQwen(systemPrompt, userPrompt, conversationHistory = []) {
   const data = await response.json();
   const duration = Date.now() - startTime;
   const tokenCount = data.usage?.completion_tokens || 0;
-  
+
   // PHASE 0: Detailed logging
   console.log(`[OpenClaw] Qwen invoke complete: model=${OLLAMA_MODEL}, tokens=${tokenCount}, duration=${duration}ms`);
-  
+
   return {
     content: data.choices?.[0]?.message?.content || "",
     provider: "qwen",
@@ -626,7 +634,7 @@ async function streamQwen(systemPrompt, userPrompt, conversationHistory = [], on
           fullContent += delta;
           tokenCount++;
           onToken(delta);
-          
+
           // PHASE 0: Progress indicators every 5 seconds
           const now = Date.now();
           if (now - lastProgressUpdate > 5000) {
@@ -642,7 +650,7 @@ async function streamQwen(systemPrompt, userPrompt, conversationHistory = [], on
   }
 
   const duration = Date.now() - startTime;
-  
+
   // PHASE 0: Detailed logging
   console.log(`[OpenClaw] Qwen stream complete: model=${OLLAMA_MODEL}, tokens=${tokenCount}, duration=${duration}ms`);
 
@@ -662,15 +670,15 @@ async function streamQwen(systemPrompt, userPrompt, conversationHistory = [], on
 async function invokeQwenWithRetry(systemPrompt, userPrompt, conversationHistory = [], maxRetries = 2) {
   let lastError;
   let retryCount = 0;
-  
+
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       const result = await invokeQwen(systemPrompt, userPrompt, conversationHistory);
-      
+
       if (attempt > 0) {
         console.log(`[OpenClaw] Qwen retry succeeded on attempt ${attempt + 1}`);
       }
-      
+
       return {
         ...result,
         retryCount: attempt
@@ -678,14 +686,14 @@ async function invokeQwenWithRetry(systemPrompt, userPrompt, conversationHistory
     } catch (error) {
       lastError = error;
       retryCount = attempt + 1;
-      
+
       // Only retry on connection/timeout errors
-      const isRetryable = error.message.includes('connection') || 
-                          error.message.includes('timeout') ||
-                          error.message.includes('ECONNREFUSED') ||
-                          error.message.includes('ETIMEDOUT') ||
-                          error.message.includes('fetch failed');
-      
+      const isRetryable = error.message.includes('connection') ||
+        error.message.includes('timeout') ||
+        error.message.includes('ECONNREFUSED') ||
+        error.message.includes('ETIMEDOUT') ||
+        error.message.includes('fetch failed');
+
       if (isRetryable && attempt < maxRetries) {
         const delay = 2000 * (attempt + 1);  // Exponential backoff: 2s, 4s
         console.log(`[OpenClaw] Qwen connection error, retrying in ${delay}ms (${attempt + 1}/${maxRetries})...`);
@@ -693,13 +701,13 @@ async function invokeQwenWithRetry(systemPrompt, userPrompt, conversationHistory
         await new Promise(r => setTimeout(r, delay));
         continue;
       }
-      
+
       // Don't retry other errors
       console.error(`[OpenClaw] Qwen error (not retryable or max retries exceeded): ${error.message}`);
       throw error;
     }
   }
-  
+
   throw lastError;
 }
 
@@ -762,14 +770,14 @@ async function streamAgent(sessionId, prompt, role, conversationHistory = [], ap
 // Network diagnostic endpoint - comprehensive container network analysis
 app.get("/debug/network", async (req, res) => {
   console.log("[OpenClaw] Running comprehensive network diagnostics...");
-  
+
   const { execSync } = await import("child_process");
   const os = await import("os");
   const dns = await import("dns");
   const { promisify } = await import("util");
   const dnsResolve = promisify(dns.resolve);
   const dnsResolve4 = promisify(dns.resolve4);
-  
+
   // Step 1: Gather container network info
   let networkInfo = {};
   try {
@@ -855,16 +863,16 @@ app.get("/debug/network", async (req, res) => {
       signal: AbortSignal.timeout(3000)
     });
     coolifyReachable = coolifyResp.ok || coolifyResp.status < 500;
-    networkInfo.coolifyApiTest = { 
+    networkInfo.coolifyApiTest = {
       url: "http://host.docker.internal:8000",
-      reachable: true, 
-      status: coolifyResp.status 
+      reachable: true,
+      status: coolifyResp.status
     };
   } catch (e) {
-    networkInfo.coolifyApiTest = { 
+    networkInfo.coolifyApiTest = {
       url: "http://host.docker.internal:8000",
-      reachable: false, 
-      error: e.message 
+      reachable: false,
+      error: e.message
     };
     // Try gateway IP for Coolify
     if (gateway) {
@@ -872,16 +880,16 @@ app.get("/debug/network", async (req, res) => {
         const gwResp = await fetch(`http://${gateway}:8000/api/v1/version`, {
           signal: AbortSignal.timeout(3000)
         });
-        networkInfo.coolifyViaGateway = { 
+        networkInfo.coolifyViaGateway = {
           url: `http://${gateway}:8000`,
-          reachable: true, 
-          status: gwResp.status 
+          reachable: true,
+          status: gwResp.status
         };
       } catch (e2) {
-        networkInfo.coolifyViaGateway = { 
+        networkInfo.coolifyViaGateway = {
           url: `http://${gateway}:8000`,
-          reachable: false, 
-          error: e2.message 
+          reachable: false,
+          error: e2.message
         };
       }
     }
@@ -896,7 +904,7 @@ app.get("/debug/network", async (req, res) => {
         signal: AbortSignal.timeout(5000)
       });
       const latency = Date.now() - startTime;
-      
+
       if (response.ok) {
         const data = await response.json();
         const models = (data.models || []).map(m => m.name);
@@ -1041,11 +1049,11 @@ app.get("/agents", (req, res) => {
 // Invoke agent (non-streaming)
 app.post("/invoke", async (req, res) => {
   const startTime = Date.now();
-  
+
   // PHASE 0: Set request/response timeouts
   req.setTimeout(600000);  // 10 minutes
   res.setTimeout(600000);
-  
+
   try {
     const { prompt, sessionId, mode, conversationHistory, platform, approvedPlan } = req.body;
 
@@ -1072,7 +1080,7 @@ app.post("/invoke", async (req, res) => {
     }
 
     const duration = Date.now() - startTime;
-    
+
     // PHASE 0: Enhanced logging with retry count
     console.log(`[OpenClaw] Response: ${duration}ms, ${result.content.length} chars, provider=${result.provider}, retries=${result.retryCount || 0}`);
 
@@ -1107,11 +1115,11 @@ app.post("/invoke", async (req, res) => {
 // Invoke agent with streaming (SSE)
 app.post("/invoke/stream", async (req, res) => {
   const startTime = Date.now();
-  
+
   // PHASE 0: Set request/response timeouts for streaming
   req.setTimeout(900000);  // 15 minutes
   res.setTimeout(900000);
-  
+
   try {
     const { prompt, sessionId, mode, conversationHistory, platform, approvedPlan } = req.body;
 
@@ -1420,7 +1428,7 @@ app.post("/invoke/multi/stream", async (req, res) => {
 // Start autonomous execution
 app.post("/autonomous/execute", async (req, res) => {
   const startTime = Date.now();
-  
+
   try {
     const { prompt, sessionId } = req.body;
 
@@ -1620,7 +1628,7 @@ app.use((err, req, res, next) => {
 const server = app.listen(PORT, HOST, async () => {
   const ollamaHealth = await checkOllamaHealth();
   const sandboxHealth = await sandboxManager.healthCheck();
-  
+
   console.log("========================================");
   console.log(`✅ OpenClaw v4.0.0 AUTONOMOUS BUILD LOOP running on http://${HOST}:${PORT}`);
   console.log(`✅ Health: http://${HOST}:${PORT}/health`);
