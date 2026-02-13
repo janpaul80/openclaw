@@ -32,24 +32,48 @@ if (process.env.SSH_PRIVATE_KEY) {
       logger.info({ type: 'ssh_init', sshDir }, 'Created SSH directory');
     }
 
-    // Detect if key is base64 encoded or raw text
-    let keyContent = process.env.SSH_PRIVATE_KEY.trim();
-    if (!keyContent.includes("BEGIN") && !keyContent.startsWith("ssh-")) {
+    let keyContent = (process.env.SSH_PRIVATE_KEY || '').trim();
+
+    // Remove BOM if present
+    if (keyContent.charCodeAt(0) === 0xFEFF) {
+      keyContent = keyContent.slice(1);
+    }
+
+    // Heuristic: If it doesn't have the header, it's likely base64 encoded
+    if (!keyContent.includes("BEGIN OPENSSH PRIVATE KEY") && !keyContent.includes("BEGIN RSA PRIVATE KEY")) {
       try {
-        keyContent = Buffer.from(keyContent, "base64").toString("utf8");
+        logger.info({ type: 'ssh_init' }, 'Attempting to decode SSH key from Base64');
+        const decoded = Buffer.from(keyContent, "base64").toString("utf8");
+        if (decoded.includes("BEGIN")) {
+          keyContent = decoded;
+        }
       } catch (e) {
         logger.warn({ type: 'ssh_init', error: e.message }, 'Failed to decode SSH_PRIVATE_KEY as base64, using as raw text');
       }
     }
 
+    // Normalize line endings to \n (Unix)
+    keyContent = keyContent.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+    // Ensure it ends with a newline
+    if (!keyContent.endsWith('\n')) {
+      keyContent += '\n';
+    }
+
     fs.writeFileSync(keyPath, keyContent, { mode: 0o600 });
+
+    // Verify file written correctly
+    const stats = fs.statSync(keyPath);
 
     logger.info({
       type: 'ssh_init',
       keyPath,
       keySize: keyContent.length,
-      isBase64: !process.env.SSH_PRIVATE_KEY.includes("BEGIN")
-    }, 'SSH configuration complete');
+      fileMode: (stats.mode & 0o777).toString(8),
+      firstLine: keyContent.split('\n')[0],
+      isBase64Input: !process.env.SSH_PRIVATE_KEY.includes("BEGIN")
+    }, 'SSH configuration completed with robust formatting');
+
   } catch (error) {
     logger.error({
       type: 'ssh_init',
