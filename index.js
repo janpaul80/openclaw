@@ -94,7 +94,7 @@ const DIRECT_LINE_BASE = process.env.DIRECT_LINE_BASE || "https://europe.directl
 
 // Provider 2: Qwen via Ollama (SECONDARY - Execution/Building)
 const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://87.106.111.220:11434";
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "qwen2.5-coder:14b";
+const OLLAMA_MODEL = "qwen2.5-coder:14b";
 const OLLAMA_FIXER_MODEL = process.env.OLLAMA_FIXER_MODEL || "qwen2.5-coder:1.5b";
 
 // ============================================================
