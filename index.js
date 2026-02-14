@@ -123,7 +123,7 @@ const OLLAMA_1_5B_MODEL = "qwen2.5-coder:1.5b";
 
 let activeBuilderRequests = 0;
 
-const PHASE_3_6_ENABLED = process.env.PHASE_3_6_ENABLED === 'true';
+const PHASE_3_6_ENABLED = true;
 
 /**
  * PHASE 3.6: Intent Detection
