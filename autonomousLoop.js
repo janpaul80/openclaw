@@ -11,7 +11,7 @@
 
 import orchestrator from "./orchestrator.js";
 import logger, { createSessionLogger, logError, logPerformance } from "./logger.js";
-import { recordExecutionStart, recordRetry, recordFixerResult } from "./metrics.js";
+import { recordExecutionStart, recordRetry, recordFixerResult, recordFixCycles } from "./metrics.js";
 
 // ============================================================
 // AUTONOMOUS LOOP
@@ -69,7 +69,7 @@ class AutonomousLoop {
         }, 'Invoking planner agent');
         return await agentInvokers.planner(prompt);
       },
-      
+
       builder: async (prompt, plan) => {
         sessionLogger.info({
           type: 'agent_invoke',
@@ -79,7 +79,7 @@ class AutonomousLoop {
         }, 'Invoking builder agent');
         return await agentInvokers.builder(prompt, plan);
       },
-      
+
       fixer: async (prompt) => {
         sessionLogger.info({
           type: 'agent_invoke',
@@ -102,9 +102,10 @@ class AutonomousLoop {
         prompt,
         agents,
         {
+          complexity: options.complexity,
           onEvent: (event) => {
             loop.events.push(event);
-            
+
             // Log important events
             if (['planning_complete', 'building_complete', 'fixing_complete', 'execution_complete'].includes(event.type)) {
               sessionLogger.info({
@@ -113,7 +114,7 @@ class AutonomousLoop {
                 data: event.data
               }, `Execution event: ${event.type}`);
             }
-            
+
             // Forward events to callback if provided
             if (options.onEvent) {
               options.onEvent(event);
@@ -133,7 +134,7 @@ class AutonomousLoop {
       // Get final result
       const details = orchestrator.getDetails(sessionId);
       const duration = Date.now() - loop.startTime;
-      
+
       if (details && details.state === "success") {
         loop.status = "success";
         loop.result = {
@@ -144,16 +145,17 @@ class AutonomousLoop {
           duration,
           snapshots: details.snapshots
         };
-        
+
         this.metrics.successful++;
         this.updateAvgIterations(details.currentIteration);
-        
+
         recordExecution('success', 'completed');
+        recordFixCycles(options.complexity || 'medium', details.model || 'unknown', details.currentIteration);
         logPerformance(sessionLogger, 'autonomous_loop', duration, {
           iterations: details.currentIteration,
           snapshots: details.snapshots.length
         });
-        
+
         sessionLogger.info({
           type: 'loop_success',
           iterations: details.currentIteration,
@@ -168,11 +170,11 @@ class AutonomousLoop {
           iterations: details ? details.currentIteration : 0,
           duration
         };
-        
+
         this.metrics.failed++;
-        
+
         recordExecution('failed', 'completed');
-        
+
         sessionLogger.warn({
           type: 'loop_failed',
           error: loop.result.error,
@@ -190,15 +192,15 @@ class AutonomousLoop {
         error: error.message,
         duration
       };
-      
+
       this.metrics.failed++;
       recordExecution('error', 'failed');
-      
+
       logError(sessionLogger, error, {
         type: 'loop_error',
         duration_ms: duration
       });
-      
+
       return loop.result;
     } finally {
       // Cleanup
@@ -218,7 +220,7 @@ class AutonomousLoop {
 
     while (Date.now() - startTime < timeout) {
       const status = orchestrator.getStatus(sessionId);
-      
+
       if (!status.found) {
         throw new Error("Execution not found");
       }
@@ -241,7 +243,7 @@ class AutonomousLoop {
    */
   async stop(sessionId, reason = "manual") {
     const loop = this.sessions.get(sessionId);
-    
+
     if (!loop) {
       logger.warn({
         type: 'loop_stop_failed',
@@ -252,7 +254,7 @@ class AutonomousLoop {
     }
 
     const sessionLogger = loop.logger || createSessionLogger(sessionId);
-    
+
     sessionLogger.warn({
       type: 'loop_stop',
       reason,
@@ -282,7 +284,7 @@ class AutonomousLoop {
    */
   getStatus(sessionId) {
     const loop = this.sessions.get(sessionId);
-    
+
     if (!loop) {
       return { found: false };
     }
@@ -304,7 +306,7 @@ class AutonomousLoop {
    */
   getDetails(sessionId) {
     const loop = this.sessions.get(sessionId);
-    
+
     if (!loop) {
       return null;
     }

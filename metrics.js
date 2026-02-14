@@ -4,7 +4,7 @@ import client from 'prom-client';
 const register = new client.Registry();
 
 // Add default metrics (CPU, memory, event loop, etc.)
-client.collectDefaultMetrics({ 
+client.collectDefaultMetrics({
   register,
   prefix: 'openclaw_',
   labels: { service: 'openclaw' }
@@ -61,6 +61,37 @@ export const fixerEffectiveness = new client.Counter({
   name: 'openclaw_fixer_effectiveness',
   help: 'Fixer agent effectiveness (fixed vs failed)',
   labelNames: ['result'],
+  registers: [register],
+});
+
+/**
+ * Fix cycles histogram - tracks how many iterations were needed for success
+ */
+export const fixCycles = new client.Histogram({
+  name: 'openclaw_fix_cycles',
+  help: 'Number of fix iterations per successful execution',
+  labelNames: ['complexity', 'model'],
+  buckets: [1, 2, 3, 4, 5],
+  registers: [register],
+});
+
+/**
+ * First-pass success counter
+ */
+export const firstPassSuccess = new client.Counter({
+  name: 'openclaw_first_pass_success_total',
+  help: 'Number of executions that succeeded on the first pass',
+  labelNames: ['complexity', 'model'],
+  registers: [register],
+});
+
+/**
+ * Model routing decisions
+ */
+export const routingDecisions = new client.Counter({
+  name: 'openclaw_routing_decision_total',
+  help: 'Total model routing decisions',
+  labelNames: ['role', 'model', 'reason', 'complexity'],
   registers: [register],
 });
 
@@ -170,7 +201,7 @@ export const vpsDiskUsage = new client.Gauge({
 export const agentInvocations = new client.Counter({
   name: 'openclaw_agent_invocations_total',
   help: 'Total agent invocations by role and provider',
-  labelNames: ['role', 'provider', 'status'],
+  labelNames: ['role', 'provider', 'status', 'model'],
   registers: [register],
 });
 
@@ -180,8 +211,59 @@ export const agentInvocations = new client.Counter({
 export const agentResponseTime = new client.Histogram({
   name: 'openclaw_agent_response_duration_seconds',
   help: 'Agent response time in seconds',
-  labelNames: ['role', 'provider'],
+  labelNames: ['role', 'provider', 'model'],
   buckets: [1, 5, 10, 30, 60, 120, 300],
+  registers: [register],
+});
+
+/**
+ * Token usage histogram
+ */
+export const tokenUsage = new client.Histogram({
+  name: 'openclaw_token_usage',
+  help: 'Token usage per request',
+  labelNames: ['role', 'provider', 'type', 'model'], // type: prompt, completion
+  buckets: [100, 500, 1000, 2000, 4000, 8000, 16000],
+  registers: [register],
+});
+
+/**
+ * Agent response size histogram (characters)
+ */
+export const responseSize = new client.Histogram({
+  name: 'openclaw_agent_response_size_chars',
+  help: 'Agent response size in characters',
+  labelNames: ['role', 'provider', 'model'],
+  buckets: [1000, 5000, 10000, 20000, 50000, 100000],
+  registers: [register],
+});
+
+/**
+ * Currently active builder invocations (queue depth)
+ */
+export const builderQueueSize = new client.Gauge({
+  name: 'openclaw_builder_queue_size',
+  help: 'Number of currently active builder/coder/executor invocations',
+  registers: [register],
+});
+
+/**
+ * Queue wait time before inference starts
+ */
+export const queueWaitTime = new client.Histogram({
+  name: 'openclaw_builder_wait_seconds',
+  help: 'Time spent waiting in queue before builder inference starts',
+  buckets: [1, 5, 10, 30, 60, 120, 300],
+  registers: [register],
+});
+
+/**
+ * SSH command duration histogram
+ */
+export const sshDuration = new client.Histogram({
+  name: 'openclaw_ssh_duration_seconds',
+  help: 'SSH command execution duration in seconds',
+  buckets: [0.1, 0.5, 1, 2, 5, 10, 30],
   registers: [register],
 });
 
@@ -197,11 +279,11 @@ export const agentResponseTime = new client.Histogram({
 export function recordExecutionStart(sessionId) {
   activeExecutions.inc();
   const startTime = Date.now();
-  
+
   return (status, phase) => {
     activeExecutions.dec();
     const duration = (Date.now() - startTime) / 1000;
-    
+
     executionCounter.inc({ status, phase });
     executionDuration.observe({ phase: 'total', status }, duration);
   };
@@ -215,10 +297,10 @@ export function recordExecutionStart(sessionId) {
 export function recordSandboxCreation(containerId) {
   activeSandboxContainers.inc();
   const startTime = Date.now();
-  
+
   return (status) => {
     const duration = (Date.now() - startTime) / 1000;
-    
+
     sandboxContainers.inc({ operation: 'created', status });
     sandboxCreationDuration.observe(duration);
   };
@@ -231,11 +313,11 @@ export function recordSandboxCreation(containerId) {
  */
 export function recordSandboxCleanup(containerId) {
   const startTime = Date.now();
-  
+
   return (status) => {
     activeSandboxContainers.dec();
     const duration = (Date.now() - startTime) / 1000;
-    
+
     sandboxContainers.inc({ operation: 'destroyed', status });
     sandboxCleanupDuration.observe(duration);
   };
@@ -275,19 +357,43 @@ export function recordFixerResult(result) {
 }
 
 /**
+ * Record fix cycles and first-pass success
+ * @param {string} complexity 
+ * @param {string} model 
+ * @param {number} iterations 
+ */
+export function recordFixCycles(complexity, model, iterations) {
+  fixCycles.observe({ complexity, model }, iterations);
+  if (iterations === 1) {
+    firstPassSuccess.inc({ complexity, model });
+  }
+}
+
+/**
+ * Record routing decision
+ * @param {string} role 
+ * @param {string} model 
+ * @param {string} reason 
+ * @param {string} complexity 
+ */
+export function recordRoutingDecision(role, model, reason, complexity) {
+  routingDecisions.inc({ role, model, reason, complexity });
+}
+
+/**
  * Record agent invocation
  * @param {string} role - Agent role
  * @param {string} provider - Provider (microsoft, qwen)
  * @returns {function} End function to record completion
  */
-export function recordAgentInvocation(role, provider) {
+export function recordAgentInvocation(role, provider, model = 'unknown') {
   const startTime = Date.now();
-  
+
   return (status) => {
     const duration = (Date.now() - startTime) / 1000;
-    
-    agentInvocations.inc({ role, provider, status });
-    agentResponseTime.observe({ role, provider }, duration);
+
+    agentInvocations.inc({ role, provider, status, model });
+    agentResponseTime.observe({ role, provider, model }, duration);
   };
 }
 

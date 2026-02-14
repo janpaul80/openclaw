@@ -12,6 +12,7 @@
 
 import { exec } from "child_process";
 import { promisify } from "util";
+import { sshDuration } from "./metrics.js";
 
 const execAsync = promisify(exec);
 
@@ -57,6 +58,7 @@ class SandboxManager {
     const sshCommand = `ssh -i ${VPS_SSH_KEY} -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VPS_USER}@${VPS_HOST} "docker ${command}"`;
 
     console.log(`[SandboxManager] SSH Docker: ${command.substring(0, 100)}...`);
+    const start = Date.now();
 
     try {
       const { stdout, stderr } = await execAsync(sshCommand, {
@@ -64,12 +66,18 @@ class SandboxManager {
         maxBuffer: 10 * 1024 * 1024 // 10MB buffer
       });
 
+      const duration = (Date.now() - start) / 1000;
+      sshDuration.observe(duration);
+
       if (stderr && !stderr.includes("WARNING")) {
         console.warn(`[SandboxManager] Docker stderr: ${stderr}`);
       }
 
       return stdout.trim();
     } catch (error) {
+      const duration = (Date.now() - start) / 1000;
+      sshDuration.observe(duration);
+
       console.error(`[SandboxManager] Docker command failed: ${error.message}`);
       throw new Error(`Docker SSH command failed: ${error.message}`);
     }
@@ -104,13 +112,13 @@ class SandboxManager {
     const workdir = `/workspace/${sessionId}`;
 
     try {
-      // Security: Drop all capabilities, read-only root, no privileged mode
+      // Security: Drop all capabilities, no privileged mode
+      // NOTE: REMOVED --read-only flag to allow npm install and file writes (verified build)
       const createCmd = [
         "run -d",
         `--name ${containerName}`,
         `--cpus=${CONTAINER_CPU_LIMIT}`,
         `--memory=${CONTAINER_MEMORY_LIMIT}`,
-        "--read-only",
         "--tmpfs /tmp:rw,noexec,nosuid,size=1g",
         `--tmpfs ${workdir}:rw,exec,nosuid,size=5g`,
         "--cap-drop=ALL",
@@ -141,6 +149,21 @@ class SandboxManager {
       };
 
       this.containers.set(sessionId, container);
+
+      // Validation: Attempt to create a test file to confirm writability
+      console.log(`[SandboxManager] Validating container filesystem for ${sessionId}...`);
+      try {
+        const testFile = `.write_test_${Date.now()}`;
+        const validateWrite = await this.execInContainer(sessionId, `touch ${testFile} && rm ${testFile}`);
+        if (!validateWrite.success) {
+          throw new Error(`Filesystem validation failed: ${validateWrite.output}`);
+        }
+        console.log(`[SandboxManager] Container validation successful`);
+      } catch (err) {
+        console.error(`[SandboxManager] Container validation FAILED: ${err.message}`);
+        await this.destroyContainer(sessionId, "validation_failed");
+        throw new Error(`Sandbox creation failed validation: ${err.message}`);
+      }
       this.metrics.created++;
 
       console.log(`[SandboxManager] Container created: ${containerId.substring(0, 12)} for session ${sessionId}`);
@@ -178,7 +201,8 @@ class SandboxManager {
     console.log(`[SandboxManager] Exec in ${container.id.substring(0, 12)}: ${command.substring(0, 80)}...`);
 
     try {
-      const execCmd = `exec ${container.id} sh -c "${command.replace(/"/g, '\\"')}"`;
+      // Use single quotes for sh -c to avoid issues with double quotes in JSON/content
+      const execCmd = `exec ${container.id} sh -c '${command.replace(/'/g, "'\\''")}'`;
       const output = await this.dockerExec(execCmd, timeout);
 
       container.metrics.commandsExecuted++;
@@ -200,32 +224,76 @@ class SandboxManager {
   }
 
   /**
-   * Write file to container
+   * Write multiple files to container in a single batch
+   * @param {string} sessionId 
+   * @param {Array<{filepath: string, content: string}>} files 
    */
-  async writeFile(sessionId, filepath, content) {
-    const container = this.containers.get(sessionId);
+  async writeFiles(sessionId, files) {
+    if (!files || files.length === 0) return { success: true, filesWritten: 0 };
 
+    const container = this.containers.get(sessionId);
     if (!container) {
       throw new Error(`No container found for session ${sessionId}`);
     }
 
-    console.log(`[SandboxManager] Writing file ${filepath} to ${container.id.substring(0, 12)}`);
+    console.log(`[SandboxManager] Batch writing ${files.length} files to ${container.id.substring(0, 12)}`);
+    const start = Date.now();
 
     try {
-      // Escape content for shell
-      const escapedContent = Buffer.from(content).toString('base64');
-      const command = `echo '${escapedContent}' | base64 -d > ${filepath}`;
+      // Create a shell script to write all files
+      // We use base64 for each file to ensure safe transfer of any character
+      let script = "#!/bin/sh\n";
+      for (const file of files) {
+        const b64 = Buffer.from(file.content).toString('base64');
+        script += `mkdir -p "$(dirname "${file.filepath}")"\n`;
+        script += `echo '${b64}' | base64 -d > "${file.filepath}"\n`;
+      }
 
-      await this.execInContainer(sessionId, command);
-      container.metrics.filesCreated++;
+      // Execute the script in the container via one SSH session
+      // We pipe the script to stdin of docker exec
+      const sshCommand = `ssh -i ${VPS_SSH_KEY} -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VPS_USER}@${VPS_HOST} "docker exec -i ${container.id} sh"`;
 
-      console.log(`[SandboxManager] File written: ${filepath} (${content.length} bytes)`);
+      const { exec } = await import("child_process");
+      const { spawn } = await import("child_process");
 
-      return { success: true, filepath };
+      return new Promise((resolve, reject) => {
+        const process = spawn('sh', ['-c', sshCommand]);
+
+        let stdout = '';
+        let stderr = '';
+
+        process.stdout.on('data', (data) => stdout += data);
+        process.stderr.on('data', (data) => stderr += data);
+
+        process.on('close', (code) => {
+          const duration = (Date.now() - start) / 1000;
+          sshDuration.observe(duration);
+
+          if (code === 0) {
+            container.metrics.filesCreated += files.length;
+            console.log(`[SandboxManager] Batch write complete: ${files.length} files in ${duration.toFixed(2)}s`);
+            resolve({ success: true, filesWritten: files.length, duration });
+          } else {
+            console.error(`[SandboxManager] Batch write failed (code ${code}): ${stderr}`);
+            reject(new Error(`Batch write failed: ${stderr}`));
+          }
+        });
+
+        // Write the script to stdin and close it
+        process.stdin.write(script);
+        process.stdin.end();
+      });
     } catch (error) {
-      console.error(`[SandboxManager] Failed to write file: ${error.message}`);
+      console.error(`[SandboxManager] Batch write error: ${error.message}`);
       throw error;
     }
+  }
+
+  /**
+   * Write single file to container
+   */
+  async writeFile(sessionId, filepath, content) {
+    return this.writeFiles(sessionId, [{ filepath, content }]);
   }
 
   /**

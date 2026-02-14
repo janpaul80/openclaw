@@ -7,7 +7,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import logger, { createLogger, createSessionLogger } from "./logger.js";
-import { getMetrics, updateSandboxHealth } from "./metrics.js";
+import { getMetrics, updateSandboxHealth, tokenUsage, responseSize, recordAgentInvocation, builderQueueSize, queueWaitTime } from "./metrics.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -95,6 +95,7 @@ const DIRECT_LINE_BASE = process.env.DIRECT_LINE_BASE || "https://europe.directl
 // Provider 2: Qwen via Ollama (SECONDARY - Execution/Building)
 const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://87.106.111.220:11434";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "qwen2.5-coder:14b";
+const OLLAMA_FIXER_MODEL = process.env.OLLAMA_FIXER_MODEL || "qwen2.5-coder:1.5b";
 
 // ============================================================
 // Agent Role → Provider Routing
@@ -116,6 +117,132 @@ const MICROSOFT_ROLE_NAMES = {
 
 // Qwen via Ollama: execution muscle (bulk code generation, installs, fixes)
 const QWEN_ROLES = ["builder", "installer", "fixer", "coder", "executor"];
+
+const OLLAMA_7B_MODEL = "qwen2.5-coder:7b";
+const OLLAMA_1_5B_MODEL = "qwen2.5-coder:1.5b";
+
+let activeBuilderRequests = 0;
+
+const PHASE_3_6_ENABLED = process.env.PHASE_3_6_ENABLED === 'true';
+
+/**
+ * PHASE 3.6: Intent Detection
+ * Categorizes the prompt to inform model routing
+ */
+function detectIntent(prompt = '') {
+  const p = prompt.toLowerCase();
+  if (p.includes('scaffold') || p.includes('boilerplate') || p.includes('setup') || p.includes('new project')) return 'SCAFFOLD';
+  if (p.includes('crud') || p.includes('form') || p.includes('api') || p.includes('list')) return 'CRUD';
+  if (p.includes('static') || p.includes('landing') || p.includes('html only')) return 'STATIC';
+  if (p.includes('refactor') || p.includes('optimize') || p.includes('migration')) return 'REFACTOR';
+  return 'GENERAL';
+}
+
+/**
+ * Adaptive Model Routing Logic (v4.1 - Phase 3.6)
+ * Selects the best model based on role, task complexity, intent, and current queue depth.
+ */
+function getAdaptiveModel(role, complexity = 'medium', prompt = '') {
+  const intent = detectIntent(prompt);
+  let model = OLLAMA_MODEL; // Default to 14b
+  let reason = 'default_fallback';
+
+  if (role === 'fixer') {
+    model = OLLAMA_FIXER_MODEL;
+    reason = 'fixer_pinned';
+  } else if (role !== 'builder' && role !== 'coder' && role !== 'executor') {
+    model = OLLAMA_MODEL;
+    reason = 'planner_quality_pinned';
+  } else {
+    const queue = activeBuilderRequests;
+
+    // PHASE 3.6 OPTIMIZATION: Complex but "Standard" intents can use 7b
+    if (complexity === 'complex') {
+      if (PHASE_3_6_ENABLED && (intent === 'CRUD' || intent === 'STATIC' || intent === 'SCAFFOLD')) {
+        model = OLLAMA_7B_MODEL;
+        reason = `complex_optimized_${intent.toLowerCase()}`;
+      } else {
+        model = OLLAMA_MODEL;
+        reason = 'complex_pinned_quality';
+      }
+    }
+    // SIMPLE tasks: Aggressive downgrading
+    else if (complexity === 'simple') {
+      if (queue >= 3) {
+        model = OLLAMA_1_5B_MODEL;
+        reason = 'simple_queue_high';
+      } else if (queue >= 2) {
+        model = OLLAMA_7B_MODEL;
+        reason = 'simple_queue_medium';
+      } else {
+        model = OLLAMA_MODEL;
+        reason = 'simple_queue_low';
+      }
+    }
+    // MEDIUM tasks: Balanced
+    else {
+      if (queue >= 3 || (PHASE_3_6_ENABLED && intent === 'STATIC')) {
+        model = OLLAMA_7B_MODEL;
+        reason = queue >= 3 ? 'medium_queue_high' : 'medium_optimized_static';
+      } else {
+        model = OLLAMA_MODEL;
+        reason = 'medium_standard';
+      }
+    }
+  }
+
+  // Record decision in metrics
+  import('./metrics.js').then(m => {
+    m.recordRoutingDecision(role, model, reason, complexity);
+  }).catch(() => { });
+
+  if (reason !== 'default_fallback' && reason !== 'fixer_pinned') {
+    console.log(`[OpenClaw] Routing ${role} ΓåÆ ${model} (Reason: ${reason}, Intent: ${intent}, Queue: ${activeBuilderRequests})`);
+  }
+
+  return model;
+}
+
+const OLLAMA_MAX_CONCURRENCY = parseInt(process.env.OLLAMA_MAX_CONCURRENCY || "2");
+
+let ollamaQueue = [];
+let ollamaProcessing = 0;
+
+/**
+ * Enqueue an Ollama request to manage throughput and track wait times correctly.
+ */
+async function enqueueOllama(task) {
+  const waitStart = Date.now();
+  return new Promise((resolve, reject) => {
+    ollamaQueue.push({ task, resolve, reject, waitStart });
+    processOllamaQueue();
+  });
+}
+
+function processOllamaQueue() {
+  // Respect concurrency limit
+  if (ollamaProcessing >= OLLAMA_MAX_CONCURRENCY || ollamaQueue.length === 0) return;
+
+  const { task, resolve, reject, waitStart } = ollamaQueue.shift();
+  const waitSeconds = (Date.now() - waitStart) / 1000;
+
+  // Record the actual wait time in the queue
+  queueWaitTime.observe(waitSeconds);
+
+  // SLA ALERT: If average queue wait exceeding 120 seconds
+  if (waitSeconds > 120) {
+    console.warn(`[OpenClaw] SLA ALERT: Builder queue wait time exceeded 120s (${Math.round(waitSeconds)}s)!`);
+  }
+
+  ollamaProcessing++;
+  task()
+    .then(resolve)
+    .catch(reject)
+    .finally(() => {
+      ollamaProcessing--;
+      processOllamaQueue();
+    });
+}
 
 function getProviderForRole(role) {
   const normalizedRole = (role || "").toLowerCase();
@@ -232,7 +359,7 @@ CRITICAL OUTPUT FORMATTING RULES:
 2. Code must appear as free-flowing text with NO borders, NO clipping, NO scrollbars
 3. Before EACH code file, include a "Code Summary" explaining what the code does
 4. After EACH code file, include a "How to Run" section with exact commands
-5. At the TOP of each code file, include the file path as a comment (e.g., // backend/src/index.ts)
+5. At the TOP of each code block, include the file path as a comment (e.g., // filepath: src/index.ts) - THIS IS MANDATORY
 
 CODE GENERATION RULES:
 - Generate 400+ lines of real, working code
@@ -556,7 +683,8 @@ async function checkOllamaHealth() {
   }
 }
 
-async function invokeQwen(systemPrompt, userPrompt, conversationHistory = []) {
+async function invokeQwen(systemPrompt, userPrompt, conversationHistory = [], modelOverride = null) {
+  const model = modelOverride || OLLAMA_MODEL;
   const messages = [];
   messages.push({ role: "system", content: systemPrompt });
   for (const msg of conversationHistory) {
@@ -570,7 +698,7 @@ async function invokeQwen(systemPrompt, userPrompt, conversationHistory = []) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: OLLAMA_MODEL,
+      model: model,
       messages,
       temperature: 0.7,
       max_tokens: 8192,
@@ -594,7 +722,7 @@ async function invokeQwen(systemPrompt, userPrompt, conversationHistory = []) {
   return {
     content: data.choices?.[0]?.message?.content || "",
     provider: "qwen",
-    model: data.model || OLLAMA_MODEL,
+    model: data.model || model,
     latencyMs: duration,
     usage: data.usage || {},
     finishReason: data.choices?.[0]?.finish_reason || "stop",
@@ -602,7 +730,8 @@ async function invokeQwen(systemPrompt, userPrompt, conversationHistory = []) {
   };
 }
 
-async function streamQwen(systemPrompt, userPrompt, conversationHistory = [], onToken) {
+async function streamQwen(systemPrompt, userPrompt, conversationHistory = [], onToken, modelOverride = null) {
+  const model = modelOverride || OLLAMA_MODEL;
   const messages = [];
   messages.push({ role: "system", content: systemPrompt });
   for (const msg of conversationHistory) {
@@ -619,7 +748,7 @@ async function streamQwen(systemPrompt, userPrompt, conversationHistory = [], on
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: OLLAMA_MODEL,
+      model: model,
       messages,
       temperature: 0.7,
       max_tokens: 8192,
@@ -691,13 +820,13 @@ async function streamQwen(systemPrompt, userPrompt, conversationHistory = [], on
 // PHASE 0: Retry Logic for Connection Errors
 // ============================================================
 
-async function invokeQwenWithRetry(systemPrompt, userPrompt, conversationHistory = [], maxRetries = 2) {
+async function invokeQwenWithRetry(systemPrompt, userPrompt, conversationHistory = [], maxRetries = 2, modelOverride = null) {
   let lastError;
   let retryCount = 0;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      const result = await invokeQwen(systemPrompt, userPrompt, conversationHistory);
+      const result = await invokeQwen(systemPrompt, userPrompt, conversationHistory, modelOverride);
 
       if (attempt > 0) {
         console.log(`[OpenClaw] Qwen retry succeeded on attempt ${attempt + 1}`);
@@ -739,51 +868,119 @@ async function invokeQwenWithRetry(systemPrompt, userPrompt, conversationHistory
 // UNIFIED INVOKE (Routes to correct provider based on role)
 // ============================================================
 
-async function invokeAgent(sessionId, prompt, role, conversationHistory = [], approvedPlan = null) {
+async function invokeAgent(sessionId, prompt, role, conversationHistory = [], approvedPlan = null, complexity = 'medium') {
   const provider = getProviderForRole(role);
-  console.log(`[OpenClaw] Routing ${role} → ${provider}`);
 
-  if (provider === "microsoft") {
-    return await invokeMicrosoft(sessionId, prompt, role);
-  } else {
-    // Qwen execution agent
-    const systemPrompt = QWEN_AGENT_PROMPTS[role] || QWEN_AGENT_PROMPTS.builder;
-    let finalPrompt = prompt;
+  const isBuilder = role === 'builder' || role === 'coder' || role === 'executor';
+  if (provider === 'qwen' && isBuilder) {
+    activeBuilderRequests++;
+    builderQueueSize.set(activeBuilderRequests);
+  }
 
-    // If there's an approved plan, prepend it for execution agents
-    if (approvedPlan && (role === "builder" || role === "coder" || role === "executor")) {
-      finalPrompt = `APPROVED PLAN:\n${approvedPlan}\n\nNow implement this plan fully. Generate all files.\n\nOriginal request: ${prompt}`;
+  // Adaptive Model Selection (now sees the updated activeBuilderRequests)
+  const model = provider === 'microsoft' ? 'microsoft-studio' : getAdaptiveModel(role, complexity, prompt);
+
+  console.log(`[OpenClaw] Routing ${role} → ${provider} (model: ${model}, current_total_builders: ${activeBuilderRequests}, complexity: ${complexity})`);
+
+  const recordAgent = recordAgentInvocation(role, provider, model);
+
+  try {
+    let result;
+    if (provider === "microsoft") {
+      result = await invokeMicrosoft(sessionId, prompt, role);
+    } else {
+      // Qwen execution agent - Wrap in queue to track wait time vs inference
+      const systemPrompt = QWEN_AGENT_PROMPTS[role] || QWEN_AGENT_PROMPTS.builder;
+      let finalPrompt = prompt;
+
+      // If there's an approved plan, prepend it for execution agents
+      if (approvedPlan && isBuilder) {
+        finalPrompt = `APPROVED PLAN:\n${approvedPlan}\n\nNow implement this plan fully. Generate all files.\n\nOriginal request: ${prompt}`;
+      }
+
+      // Use retry wrapper with the adaptive model, inside the throughput queue
+      result = await enqueueOllama(() => invokeQwenWithRetry(systemPrompt, finalPrompt, conversationHistory, 3, model));
+
+      if (result.tokenCount) {
+        tokenUsage.observe({ role, provider: 'qwen', type: 'completion', model: result.model || model }, result.tokenCount);
+      }
+
+      if (result.content) {
+        responseSize.observe({ role, provider: 'qwen', model: result.model || model }, result.content.length);
+      }
     }
 
-    // PHASE 0: Use retry wrapper
-    return await invokeQwenWithRetry(systemPrompt, finalPrompt, conversationHistory);
+    recordAgent('success');
+    return result;
+  } catch (error) {
+    recordAgent('failed');
+    throw error;
+  } finally {
+    if (provider === 'qwen' && isBuilder) {
+      activeBuilderRequests--;
+      builderQueueSize.set(activeBuilderRequests);
+    }
   }
 }
 
-async function streamAgent(sessionId, prompt, role, conversationHistory = [], approvedPlan = null, onToken) {
+async function streamAgent(sessionId, prompt, role, conversationHistory = [], approvedPlan = null, onToken, complexity = 'medium') {
   const provider = getProviderForRole(role);
-  console.log(`[OpenClaw] Streaming ${role} → ${provider}`);
 
-  if (provider === "microsoft") {
-    // Microsoft doesn't support streaming, invoke and emit all at once
-    const result = await invokeMicrosoft(sessionId, prompt, role);
-    // Simulate streaming by emitting word by word
-    const words = result.content.split(" ");
-    for (let i = 0; i < words.length; i++) {
-      await new Promise(r => setTimeout(r, 15));
-      onToken(words[i] + (i < words.length - 1 ? " " : ""));
+  const isBuilder = role === 'builder' || role === 'coder' || role === 'executor';
+  if (provider === 'qwen' && isBuilder) {
+    activeBuilderRequests++;
+    builderQueueSize.set(activeBuilderRequests);
+  }
+
+  // Adaptive Model Selection (now sees the updated activeBuilderRequests)
+  const model = provider === 'microsoft' ? 'microsoft-studio' : getAdaptiveModel(role, complexity);
+
+  console.log(`[OpenClaw] Streaming ${role} → ${provider} (model: ${model}, current_total_builders: ${activeBuilderRequests}, complexity: ${complexity})`);
+
+  const recordAgent = recordAgentInvocation(role, provider, model);
+
+  try {
+    let result;
+    if (provider === "microsoft") {
+      // Microsoft doesn't support streaming, invoke and emit all at once
+      result = await invokeMicrosoft(sessionId, prompt, role);
+      // Simulate streaming by emitting word by word
+      const words = result.content.split(" ");
+      for (let i = 0; i < words.length; i++) {
+        await new Promise(r => setTimeout(r, 15));
+        onToken(words[i] + (i < words.length - 1 ? " " : ""));
+      }
+    } else {
+      // Qwen execution agent - Wrap in queue to track wait time vs inference
+      const systemPrompt = QWEN_AGENT_PROMPTS[role] || QWEN_AGENT_PROMPTS.builder;
+      let finalPrompt = prompt;
+
+      if (approvedPlan && isBuilder) {
+        finalPrompt = `APPROVED PLAN:\n${approvedPlan}\n\nNow implement this plan fully. Generate all files.\n\nOriginal request: ${prompt}`;
+      }
+
+      // Use the adaptive model, inside the throughput queue
+      result = await enqueueOllama(() => streamQwen(systemPrompt, finalPrompt, conversationHistory, onToken, model));
+
+      if (result.tokenCount) {
+        tokenUsage.observe({ role, provider: 'qwen', type: 'completion', model: result.model || model }, result.tokenCount);
+      }
+
+      if (result.content) {
+        responseSize.observe({ role, provider: 'qwen', model: result.model || model }, result.content.length);
+      }
     }
+
+    recordAgent('success');
     return result;
-  } else {
-    // Qwen supports true streaming
-    const systemPrompt = QWEN_AGENT_PROMPTS[role] || QWEN_AGENT_PROMPTS.builder;
-    let finalPrompt = prompt;
-
-    if (approvedPlan && (role === "builder" || role === "coder" || role === "executor")) {
-      finalPrompt = `APPROVED PLAN:\n${approvedPlan}\n\nNow implement this plan fully. Generate all files.\n\nOriginal request: ${prompt}`;
+  } catch (error) {
+    recordAgent('failed');
+    throw error;
+  } finally {
+    if (provider === 'qwen' && isBuilder) {
+      activeBuilderRequests--;
+      builderQueueSize.set(activeBuilderRequests);
     }
-
-    return await streamQwen(systemPrompt, finalPrompt, conversationHistory, onToken);
   }
 }
 
@@ -1454,7 +1651,7 @@ app.post("/autonomous/execute", async (req, res) => {
   const startTime = Date.now();
 
   try {
-    const { prompt, sessionId } = req.body;
+    const { prompt, sessionId, complexity = 'medium' } = req.body;
 
     if (!prompt || typeof prompt !== "string" || prompt.trim().length === 0) {
       return res.status(400).json({ success: false, error: "Prompt is required" });
@@ -1464,23 +1661,24 @@ app.post("/autonomous/execute", async (req, res) => {
       return res.status(400).json({ success: false, error: "Session ID is required" });
     }
 
-    console.log(`[OpenClaw] Starting autonomous execution for session ${sessionId}`);
+    console.log(`[OpenClaw] Starting autonomous execution for session ${sessionId} (complexity: ${complexity})`);
 
     // Create agent invokers
     const agentInvokers = {
       planner: async (prompt) => {
-        return await invokeAgent(sessionId, prompt, "planner", []);
+        return await invokeAgent(sessionId, prompt, "planner", [], null, complexity);
       },
       builder: async (prompt, plan) => {
-        return await invokeAgent(sessionId, prompt, "builder", [], plan);
+        return await invokeAgent(sessionId, prompt, "builder", [], plan, complexity);
       },
       fixer: async (prompt) => {
-        return await invokeAgent(sessionId, prompt, "fixer", []);
+        return await invokeAgent(sessionId, prompt, "fixer", [], null, complexity);
       }
     };
 
     // Start autonomous loop (non-blocking)
     autonomousLoop.start(sessionId, prompt, agentInvokers, {
+      complexity,
       onEvent: (event) => {
         console.log(`[OpenClaw] Autonomous event: ${event.type} (session ${sessionId})`);
       }
@@ -1567,6 +1765,17 @@ app.get("/autonomous/metrics", (req, res) => {
   } catch (error) {
     console.error(`[OpenClaw] Autonomous metrics error:`, error.message);
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Prometheus metrics endpoint
+app.get("/metrics", async (req, res) => {
+  try {
+    const metrics = await getMetrics();
+    res.set('Content-Type', 'text/plain');
+    res.send(metrics);
+  } catch (error) {
+    res.status(500).send(error.message);
   }
 });
 
