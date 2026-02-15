@@ -93,7 +93,10 @@ const MICROSOFT_STUDIO_SECRET_KEY = process.env.MICROSOFT_STUDIO_SECRET_KEY || "
 const DIRECT_LINE_BASE = process.env.DIRECT_LINE_BASE || "https://europe.directline.botframework.com/v3/directline";
 
 // Provider 2: Qwen via Ollama (SECONDARY - Execution/Building)
-const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://87.106.111.220:11434";
+const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://87.106.111.220:11434"; // Default to CPU VPS
+const OLLAMA_PRIMARY_URL = process.env.OLLAMA_PRIMARY_URL || "http://79.112.58.103:29409/ollama"; // GPU Primary (Hardcoded for Phase G1)
+const OLLAMA_PRIMARY_KEY = process.env.OLLAMA_PRIMARY_KEY || "sk-b4477739f6804216bbdb5ab62aa4580b"; // Primary Key
+const OLLAMA_TIMEOUT = parseInt(process.env.OLLAMA_TIMEOUT || "120000"); // 2 minutes default
 const OLLAMA_MODEL = "qwen2.5-coder:14b";
 const OLLAMA_FIXER_MODEL = process.env.OLLAMA_FIXER_MODEL || "qwen2.5-coder:1.5b";
 
@@ -669,18 +672,37 @@ async function invokeMicrosoft(sessionId, prompt, role) {
 // ============================================================
 
 async function checkOllamaHealth() {
-  try {
-    const response = await fetch(`${OLLAMA_BASE_URL}/api/tags`, {
-      signal: AbortSignal.timeout(5000)
-    });
-    if (!response.ok) return { status: "error", error: `HTTP ${response.status}` };
-    const data = await response.json();
-    const models = (data.models || []).map(m => m.name);
-    const hasModel = models.some(m => m.startsWith(OLLAMA_MODEL.split(":")[0]));
-    return { status: "ok", models, hasModel, targetModel: OLLAMA_MODEL };
-  } catch (err) {
-    return { status: "unreachable", error: err.message };
+  const endpoints = [];
+  if (OLLAMA_PRIMARY_URL) endpoints.push({ url: OLLAMA_PRIMARY_URL, name: 'Primary (GPU)', key: OLLAMA_PRIMARY_KEY });
+  endpoints.push({ url: OLLAMA_BASE_URL, name: 'Fallback (CPU)', key: null });
+
+  const results = {};
+
+  for (const endpoint of endpoints) {
+    try {
+      const headers = {};
+      if (endpoint.key) headers['Authorization'] = `Bearer ${endpoint.key}`;
+
+      const response = await fetch(`${endpoint.url}/api/tags`, {
+        headers,
+        signal: AbortSignal.timeout(5000)
+      });
+
+      if (!response.ok) {
+        results[endpoint.name] = { status: "error", error: `HTTP ${response.status}` };
+        continue;
+      }
+
+      const data = await response.json();
+      const models = (data.models || []).map(m => m.name);
+      const hasModel = models.some(m => m.startsWith(OLLAMA_MODEL.split(":")[0]));
+      results[endpoint.name] = { status: "ok", models, hasModel, targetModel: OLLAMA_MODEL };
+    } catch (err) {
+      results[endpoint.name] = { status: "unreachable", error: err.message };
+    }
   }
+
+  return results;
 }
 
 async function invokeQwen(systemPrompt, userPrompt, conversationHistory = [], modelOverride = null) {
@@ -692,41 +714,72 @@ async function invokeQwen(systemPrompt, userPrompt, conversationHistory = [], mo
   }
   messages.push({ role: "user", content: userPrompt });
 
+  const payload = {
+    model: model,
+    messages,
+    temperature: 0.7,
+    max_tokens: 8192,
+    stream: false
+  };
+
+  // Helper to execute request against specific endpoint
+  const executeRequest = async (url, apiKey, timeoutMs) => {
+    const headers = { "Content-Type": "application/json" };
+    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+    const response = await fetch(`${url}/v1/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`HTTP ${response.status} - ${errorText}`);
+    }
+    return response.json();
+  };
+
   const startTime = Date.now();
+  let data;
+  let providerUsed = "cpu";
 
-  const response = await fetch(`${OLLAMA_BASE_URL}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: model,
-      messages,
-      temperature: 0.7,
-      max_tokens: 8192,
-      stream: false
-    }),
-    signal: AbortSignal.timeout(600000)  // PHASE 0: Increased from 120s to 600s (10 minutes)
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Ollama error: ${response.status} - ${errorText}`);
+  // Attempt Primary (GPU) if configured
+  if (OLLAMA_PRIMARY_URL) {
+    try {
+      // console.log(`[OpenClaw] Attempting execution on Primary GPU...`);
+      data = await executeRequest(OLLAMA_PRIMARY_URL, OLLAMA_PRIMARY_KEY, OLLAMA_TIMEOUT);
+      providerUsed = "gpu";
+    } catch (err) {
+      console.warn(`[OpenClaw] Primary GPU failed (${err.message}). Falling back to CPU...`);
+    }
   }
 
-  const data = await response.json();
+  // Fallback to CPU if Primary failed or not configured
+  if (!data) {
+    try {
+      data = await executeRequest(OLLAMA_BASE_URL, null, 600000); // 10 min timeout for CPU
+      providerUsed = "cpu";
+    } catch (err) {
+      throw new Error(`All providers failed. Last error: ${err.message}`);
+    }
+  }
+
   const duration = Date.now() - startTime;
   const tokenCount = data.usage?.completion_tokens || 0;
 
-  // PHASE 0: Detailed logging
-  console.log(`[OpenClaw] Qwen invoke complete: model=${OLLAMA_MODEL}, tokens=${tokenCount}, duration=${duration}ms`);
+  console.log(`[OpenClaw] Invoke complete: provider=${providerUsed}, model=${model}, tokens=${tokenCount}, duration=${duration}ms`);
 
   return {
     content: data.choices?.[0]?.message?.content || "",
-    provider: "qwen",
+    provider: "qwen", // Legacy field
     model: data.model || model,
     latencyMs: duration,
     usage: data.usage || {},
     finishReason: data.choices?.[0]?.finish_reason || "stop",
-    tokenCount
+    tokenCount,
+    executionProvider: providerUsed // New field to track actual source
   };
 }
 
@@ -739,28 +792,59 @@ async function streamQwen(systemPrompt, userPrompt, conversationHistory = [], on
   }
   messages.push({ role: "user", content: userPrompt });
 
+
+  // Helper for streaming request
+  const executeStream = async (url, apiKey, timeoutMs) => {
+    const headers = { "Content-Type": "application/json" };
+    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+    const response = await fetch(`${url}/v1/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: model,
+        messages,
+        temperature: 0.7,
+        max_tokens: 8192,
+        stream: true
+      }),
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`HTTP ${response.status} - ${errorText}`);
+    }
+    return response;
+  };
+
+  let response;
+  let providerUsed = "cpu";
+
+  // Attempt Primary (GPU) first
+  if (OLLAMA_PRIMARY_URL) {
+    try {
+      response = await executeStream(OLLAMA_PRIMARY_URL, OLLAMA_PRIMARY_KEY, OLLAMA_TIMEOUT);
+      providerUsed = "gpu";
+    } catch (err) {
+      console.warn(`[OpenClaw] Primary GPU Stream failed (${err.message}). Falling back...`);
+    }
+  }
+
+  // Fallback to CPU
+  if (!response) {
+    try {
+      response = await executeStream(OLLAMA_BASE_URL, null, 900000); // 15 min timeout
+      providerUsed = "cpu";
+    } catch (err) {
+      throw new Error(`All streaming providers failed. Last error: ${err.message}`);
+    }
+  }
+
   const startTime = Date.now();
   let fullContent = "";
   let tokenCount = 0;
   let lastProgressUpdate = Date.now();
-
-  const response = await fetch(`${OLLAMA_BASE_URL}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: model,
-      messages,
-      temperature: 0.7,
-      max_tokens: 8192,
-      stream: true
-    }),
-    signal: AbortSignal.timeout(900000)  // PHASE 0: Increased from 180s to 900s (15 minutes)
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Ollama stream error: ${response.status} - ${errorText}`);
-  }
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
